@@ -1,0 +1,13 @@
+GNU GENERAL PUBLIC LICENSE
+Version 3, 29 June 2007
+
+This project is licensed under the GNU General Public License version 3 or,
+at your option, any later version.
+
+The full GPLv3 license text is available from:
+https://www.gnu.org/licenses/gpl-3.0.txt
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+Note: third-party dependencies keep their own licenses. In particular,
+libsmb2 is LGPL-2.1-or-later upstream.

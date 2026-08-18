@@ -1,0 +1,18 @@
+version: "0.2.0"
+description: "SMB2/SMB3 server component for exposing an ESP-IDF VFS mount point"
+license: "GPL-3.0-or-later"
+tags:
+  - smb
+  - smb2
+  - smb3
+  - filesystem
+  - vfs
+  - network
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c3
+dependencies:
+  idf:
+    version: ">=6.0"

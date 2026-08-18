@@ -1,0 +1,35 @@
+menu "SMB Server"
+
+  config SMB_SERVER_DEFAULT_SHARE_NAME
+    string "Default share name"
+    default "ESP32"
+    help
+      Default SMB share name used by SMB_SERVER_DEFAULT_CONFIG().
+
+  config SMB_SERVER_MAX_CLIENTS
+    int "Maximum simultaneous SMB clients"
+    range 1 4
+    default 1
+    help
+      A small default is intentional because ESP32 RAM is limited.
+
+  config SMB_SERVER_TASK_STACK_SIZE
+    int "SMB server task stack size"
+    range 4096 32768
+    default 12288
+
+  config SMB_SERVER_TASK_PRIORITY
+    int "SMB server task priority"
+    range 1 20
+    default 5
+
+  config SMB_SERVER_PORT
+    int "SMB TCP port"
+    range 1 65535
+    default 445
+
+  config SMB_SERVER_VERBOSE_LOGGING
+    bool "Enable verbose SMB server logging"
+    default n
+
+endmenu
