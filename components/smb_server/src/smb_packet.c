@@ -55,6 +55,32 @@ void smb2_put_u64_le(uint8_t *data, uint64_t value)
   data[7] = (uint8_t)(value >> 56);
 }
 
+const char *smb2_command_name(uint16_t command)
+{
+  switch (command)
+  {
+    case SMB2_NEGOTIATE:       return "NEGOTIATE";
+    case SMB2_SESSION_SETUP:   return "SESSION_SETUP";
+    case SMB2_LOGOFF:          return "LOGOFF";
+    case SMB2_TREE_CONNECT:    return "TREE_CONNECT";
+    case SMB2_TREE_DISCONNECT: return "TREE_DISCONNECT";
+    case SMB2_CREATE:          return "CREATE";
+    case SMB2_CLOSE:           return "CLOSE";
+    case SMB2_FLUSH:           return "FLUSH";
+    case SMB2_READ:            return "READ";
+    case SMB2_WRITE:           return "WRITE";
+    case SMB2_LOCK:            return "LOCK";
+    case SMB2_IOCTL:           return "IOCTL";
+    case SMB2_CANCEL:          return "CANCEL";
+    case SMB2_ECHO:            return "ECHO";
+    case SMB2_QUERY_DIRECTORY: return "QUERY_DIRECTORY";
+    case SMB2_CHANGE_NOTIFY:   return "CHANGE_NOTIFY";
+    case SMB2_QUERY_INFO:      return "QUERY_INFO";
+    case SMB2_SET_INFO:        return "SET_INFO";
+    default:                   return "UNKNOWN";
+  }
+}
+
 int smb2_parse_header(const uint8_t *data, size_t length, smb2_header_t *header)
 {
   //-- Minimum: need signature (4) + command field (2 bytes at offset 12)
@@ -81,8 +107,8 @@ int smb2_parse_header(const uint8_t *data, size_t length, smb2_header_t *header)
   header->session_id = smb2_get_u64_le(data + 40);
   memcpy(header->signature_bytes, data + 48, 16);
 
-  ESP_LOGI(TAG, "Parsed: sig=0x%08x, struct_size=%u, cmd=0x%04x, msg_id=%llu",
-    header->signature, header->structure_size, header->command, header->message_id);
+  ESP_LOGI(TAG, "Parsed: sig=0x%08x, struct_size=%u, cmd=0x%04x (%s), msg_id=%llu",
+    header->signature, header->structure_size, header->command, smb2_command_name(header->command), header->message_id);
 
   //-- Validate signature
   if (header->signature != SMB2_SIGNATURE)

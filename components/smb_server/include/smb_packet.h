@@ -63,6 +63,7 @@
 #define STATUS_FILE_IS_A_DIRECTORY 0xc00000ba
 #define STATUS_NOT_A_DIRECTORY 0xc0000103
 #define STATUS_NOT_SUPPORTED 0xc00000bb
+#define STATUS_NO_MORE_FILES 0x80000006
 
 //-- SMB2 Session Setup response flags
 #define SMB2_SESSION_FLAG_IS_GUEST 0x0001
@@ -74,6 +75,9 @@
 #define FileAllInformation 18
 #define FileDispositionInformation 13
 #define FileEndOfFileInformation 20
+
+//-- SMB2 FileSystem Info Classes (used when info_type == SMB2_0_INFO_FILESYSTEM)
+#define FileFsSizeInformation 3
 
 //-- SMB2 Create Disposition (Disposition field)
 #define FILE_SUPERSEDE 0x00000000
@@ -403,5 +407,8 @@ void smb2_put_u64_le(uint8_t *data, uint64_t value);
 
 int smb2_parse_header(const uint8_t *data, size_t length, smb2_header_t *header);
 int smb2_build_header(uint8_t *data, size_t length, const smb2_header_t *header);
+
+//-- Human-readable name for an SMB2 command code, for logging
+const char *smb2_command_name(uint16_t command);
 
 #pragma pack()  //-- Re-enable default packing
