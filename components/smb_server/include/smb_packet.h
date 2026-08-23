@@ -76,6 +76,9 @@
 #define FileDispositionInformation 13
 #define FileEndOfFileInformation 20
 
+//-- SMB2 Query Directory File Info Classes
+#define FileIdBothDirectoryInformation 37
+
 //-- SMB2 FileSystem Info Classes (used when info_type == SMB2_0_INFO_FILESYSTEM)
 #define FileFsSizeInformation 3
 

@@ -37,10 +37,13 @@ static const char *TAG = "smb_protocol";
 
 static void smb_protocol_dump_packet(const char *label, const uint8_t *data, size_t length)
 {
-  ESP_LOGI(TAG, "%s (%zu bytes):", label, length);
+  //-- Verbose per-packet hex dump; kept at DEBUG level so it does not flood
+  //-- the serial monitor buffer and push more targeted INFO/WARN diagnostics
+  //-- out of the scrollback during interactive debugging.
+  ESP_LOGD(TAG, "%s (%zu bytes):", label, length);
   for (size_t i = 0; i < (length > 200 ? 200 : length); i += 16)
   {
-    ESP_LOGI(TAG, "  [%02zu] %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+    ESP_LOGD(TAG, "  [%02zu] %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
       i,
       (i + 0 < length) ? data[i + 0] : 0,
       (i + 1 < length) ? data[i + 1] : 0,
@@ -456,18 +459,28 @@ static int smb_protocol_handle_close(
   uint64_t file_id = smb_protocol_get_file_id(req->file_id);
   smb_session_handle_t *handle = NULL;
   uint32_t status = STATUS_SUCCESS;
+  struct stat st = {0};
+  bool have_stat = false;
   if (smb_session_lookup(file_id, &handle) != ESP_OK)
   {
     status = STATUS_INVALID_PARAMETER;
   }
   else
   {
+    //-- Capture attributes before releasing the handle; macOS's kernel client
+    //-- rejects a CLOSE response with all-zero attributes ("did not return
+    //-- close attributes") and logs a "Bad SMB 2/3 Server" kernel error.
+    have_stat = smb_vfs_stat(handle->path, &st) == 0;
     if (handle->delete_pending)
     {
       int result = handle->is_directory ? smb_vfs_rmdir(handle->path) : smb_vfs_unlink(handle->path);
       if (result != 0)
       {
         status = smb_protocol_status_from_errno(errno);
+      }
+      else
+      {
+        have_stat = false;
       }
     }
     smb_session_release(file_id);
@@ -480,7 +493,18 @@ static int smb_protocol_handle_close(
   }
   if (status == STATUS_SUCCESS)
   {
-    smb2_put_u16_le(response + SMB2_HEADER_SIZE, 60);
+    uint8_t *body = response + SMB2_HEADER_SIZE;
+    smb2_put_u16_le(body, 60);
+    if (have_stat)
+    {
+      smb2_put_u64_le(body + 8, smb_protocol_filetime(st.st_ctime));
+      smb2_put_u64_le(body + 16, smb_protocol_filetime(st.st_atime));
+      smb2_put_u64_le(body + 24, smb_protocol_filetime(st.st_mtime));
+      smb2_put_u64_le(body + 32, smb_protocol_filetime(st.st_ctime));
+      smb2_put_u64_le(body + 40, (uint64_t)st.st_size);
+      smb2_put_u64_le(body + 48, (uint64_t)st.st_size);
+      smb2_put_u32_le(body + 56, S_ISDIR(st.st_mode) ? 0x10 : 0x80);
+    }
   }
   return 0;
 }
@@ -723,7 +747,9 @@ static int smb_protocol_handle_query_directory(
   uint8_t file_info_class = req->file_information_class;
   uint8_t flags = req->flags;
 
-  if (file_info_class != 104)
+  ESP_LOGI(TAG, "QUERY_DIRECTORY: file_info_class=%u flags=0x%02x", file_info_class, flags);
+
+  if (file_info_class != FileIdBothDirectoryInformation)
     return smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_NOT_SUPPORTED, 0, response_length);
 
   smb_session_handle_t *handle = NULL;
@@ -733,16 +759,32 @@ static int smb_protocol_handle_query_directory(
   if (!handle->is_directory)
     return smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_NOT_A_DIRECTORY, 0, response_length);
 
-  if ((flags & 0x01) != 0)
+  //-- SMB2 QUERY_DIRECTORY flags (MS-SMB2 2.2.33)
+  #define SL_RESTART_SCAN 0x01
+  #define SL_RETURN_SINGLE_ENTRY 0x02
+
+  if ((flags & SL_RESTART_SCAN) != 0)
     rewinddir((DIR *)handle->dir);
+
+  bool single_entry_only = (flags & SL_RETURN_SINGLE_ENTRY) != 0;
 
   uint8_t *buffer = response + SMB2_HEADER_SIZE + 8;
   size_t buffer_size = response_capacity - SMB2_HEADER_SIZE - 8;
   size_t buffer_used = 0;
+  size_t entry_count = 0;
   struct dirent *entry;
+
+  ESP_LOGI(TAG, "QUERY_DIRECTORY: listing '%s'", handle->path);
+
+  //-- Offset (within buffer) and aligned size of the previously written entry,
+  //-- so its NextEntryOffset can be patched in once the following entry's
+  //-- position is known. (size_t)-1 means "no previous entry yet".
+  size_t prev_entry_offset = (size_t)-1;
+  size_t prev_entry_aligned_size = 0;
 
   while ((entry = readdir((DIR *)handle->dir)) != NULL && buffer_used < buffer_size)
   {
+    ESP_LOGI(TAG, "QUERY_DIRECTORY: readdir -> '%s'", entry->d_name);
     size_t name_len = strlen(entry->d_name);
     if (name_len > 127)
       continue;
@@ -767,7 +809,15 @@ static int smb_protocol_handle_query_directory(
 
     struct stat st = {0};
     if (smb_vfs_stat(entry_path, &st) != 0)
+    {
+      ESP_LOGW(TAG, "QUERY_DIRECTORY: stat('%s') failed: %d", entry_path, errno);
       continue;
+    }
+    entry_count++;
+
+    //-- Link the previous entry to this one now that its offset is known
+    if (prev_entry_offset != (size_t)-1)
+      smb2_put_u32_le(buffer + prev_entry_offset, (uint32_t)prev_entry_aligned_size);
 
     //-- Fill structure in response buffer
     uint8_t *entry_ptr = buffer + buffer_used;
@@ -793,8 +843,9 @@ static int smb_protocol_handle_query_directory(
     smb2_put_u32_le(entry_ptr + 64, 0);
     entry_ptr[68] = 0;
     entry_ptr[69] = 0;
-    memset(entry_ptr + 70, 0, 12);
-    smb2_put_u64_le(entry_ptr + 82, (uint64_t)st.st_ino);
+    //-- ShortName (24 bytes, offset 70-93) and Reserved2 (2 bytes, offset 94-95)
+    //-- are left zeroed from the memset above; we don't populate 8.3 names.
+    smb2_put_u64_le(entry_ptr + 96, (uint64_t)st.st_ino);
 
     //-- Encode filename as UTF-16LE directly into response
     uint8_t *fname_ptr = entry_ptr + 104;
@@ -806,23 +857,19 @@ static int smb_protocol_handle_query_directory(
     fname_ptr[name_len * 2] = 0;
     fname_ptr[name_len * 2 + 1] = 0;
 
+    prev_entry_offset = buffer_used;
+    prev_entry_aligned_size = next_entry_aligned;
+
     buffer_used += next_entry_aligned;
+
+    if (single_entry_only)
+      break;
   }
+
+  ESP_LOGI(TAG, "QUERY_DIRECTORY: %zu entries returned, %zu bytes", entry_count, buffer_used);
 
   if (buffer_used == 0)
     return smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_NO_MORE_FILES, 0, response_length);
-
-  //-- Update NextEntryOffset for all but last entry
-  for (size_t i = 0; i < buffer_used; i += 8)
-  {
-    uint32_t next_offset = smb2_get_u32_le(buffer + i);
-    if (next_offset == 0 && i + 8 < buffer_used)
-    {
-      uint32_t file_name_len = smb2_get_u32_le(buffer + i + 60);
-      size_t curr_entry_size = 104 + file_name_len + 2;
-      smb2_put_u32_le(buffer + i, (uint32_t)((curr_entry_size + 7) & ~7));
-    }
-  }
 
   if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 8 + buffer_used, response_length) != 0)
     return -ENOMEM;
@@ -1688,7 +1735,7 @@ static void smb_protocol_client_handler(void *arg)
       break;
     }
 
-    ESP_LOGI(TAG, "Received %zd bytes from client", bytes_read);
+    ESP_LOGD(TAG, "Received %zd bytes from client", bytes_read);
     smb_protocol_dump_packet("Request", request_buffer, (size_t)bytes_read);
 
     //-- A single recv() may coalesce multiple NetBIOS-framed SMB2 messages
