@@ -1,0 +1,4 @@
+- Try creating a new folder with SMB-Server.
+- Drag a file in.
+- Rename it.
+- Delete this file.

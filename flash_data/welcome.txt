@@ -1,4 +1,4 @@
-This file lives on the ESP32's LittleFS partition and is served over WebDAV.
+This file lives on the ESP32's LittleFS partition and is served over the SMB-share "ESP32".
 
-Try editing and saving it from your WebDAV client (e.g. Mountain Duck on
+Try editing and saving it from your PC (e.g. Filer on
 macOS) - the change is written straight to flash on the device.

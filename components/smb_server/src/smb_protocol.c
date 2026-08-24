@@ -471,19 +471,25 @@ static int smb_protocol_handle_close(
     //-- rejects a CLOSE response with all-zero attributes ("did not return
     //-- close attributes") and logs a "Bad SMB 2/3 Server" kernel error.
     have_stat = smb_vfs_stat(handle->path, &st) == 0;
-    if (handle->delete_pending)
+    bool delete_pending = handle->delete_pending;
+    bool is_directory = handle->is_directory;
+    char path[SMB_SERVER_PATH_MAX];
+    strlcpy(path, handle->path, sizeof(path));
+
+    //-- Release the handle (closes the underlying fd/dir) before deleting;
+    //-- esp_littlefs refuses to unlink a path that still has an open FD.
+    smb_session_release(file_id);
+
+    if (delete_pending)
     {
-      int result = handle->is_directory ? smb_vfs_rmdir(handle->path) : smb_vfs_unlink(handle->path);
+      int result = is_directory ? smb_vfs_rmdir(path) : smb_vfs_unlink(path);
       if (result != 0)
       {
         status = smb_protocol_status_from_errno(errno);
       }
-      else
-      {
-        have_stat = false;
-      }
+      //-- Keep the pre-delete stat captured above; macOS rejects an
+      //-- all-zero-attribute CLOSE response even for a deleted file.
     }
-    smb_session_release(file_id);
   }
 
   if (smb_protocol_build_header_response(ctx, response, response_capacity, status,
@@ -539,12 +545,17 @@ static int smb_protocol_handle_read(
     return smb_protocol_build_header_response(ctx, response, response_capacity, smb_protocol_status_from_errno(errno), 0, response_length);
   if (read_length == 0)
     return smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_END_OF_FILE, 0, response_length);
-  if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 16 + (size_t)read_length, response_length) != 0)
+  //-- body_length=0: the file data is already read into the buffer above;
+  //-- passing the real body length here would make
+  //-- smb_protocol_build_header_response() memset() that region back to
+  //-- zero right after we filled it.
+  if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 0, response_length) != 0)
     return -ENOMEM;
   uint8_t *body = response + SMB2_HEADER_SIZE;
   smb2_put_u16_le(body, 17);
   body[2] = SMB2_HEADER_SIZE + 16;
   smb2_put_u32_le(body + 4, (uint32_t)read_length);
+  *response_length = SMB2_HEADER_SIZE + 16 + (size_t)read_length;
   return 0;
 }
 
@@ -657,10 +668,14 @@ static int smb_protocol_handle_query_info(
     smb2_put_u64_le(info + 8, SMB_FS_FREE_BYTES / SMB_FS_SECTOR_SIZE);
     smb2_put_u32_le(info + 16, 1);
     smb2_put_u32_le(info + 20, SMB_FS_SECTOR_SIZE);
-    if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 8 + 24, response_length) != 0) return -ENOMEM;
+    //-- body_length=0: the info block is already written above; passing the
+    //-- real body length here would make smb_protocol_build_header_response()
+    //-- memset() that region back to zero right after we filled it.
+    if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 0, response_length) != 0) return -ENOMEM;
     smb2_put_u16_le(response + SMB2_HEADER_SIZE, 9);
     smb2_put_u16_le(response + SMB2_HEADER_SIZE + 2, SMB2_HEADER_SIZE + 8);
     smb2_put_u32_le(response + SMB2_HEADER_SIZE + 4, 24);
+    *response_length = SMB2_HEADER_SIZE + 8 + 24;
     return 0;
   }
   if (info_type != SMB2_0_INFO_FILE)
@@ -677,10 +692,14 @@ static int smb_protocol_handle_query_info(
   size_t info_length = smb_protocol_fill_file_info(response + SMB2_HEADER_SIZE + 8, capacity, info_class, &st, handle->path);
   if (info_length == 0)
     return smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_NOT_SUPPORTED, 0, response_length);
-  if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 8 + info_length, response_length) != 0) return -ENOMEM;
+  //-- body_length=0: the info block is already written above; passing the
+  //-- real body length here would make smb_protocol_build_header_response()
+  //-- memset() that region back to zero right after we filled it.
+  if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 0, response_length) != 0) return -ENOMEM;
   smb2_put_u16_le(response + SMB2_HEADER_SIZE, 9);
   smb2_put_u16_le(response + SMB2_HEADER_SIZE + 2, SMB2_HEADER_SIZE + 8);
   smb2_put_u32_le(response + SMB2_HEADER_SIZE + 4, (uint32_t)info_length);
+  *response_length = SMB2_HEADER_SIZE + 8 + info_length;
   return 0;
 }
 
@@ -724,7 +743,16 @@ static int smb_protocol_handle_set_info(
   {
     status = STATUS_NOT_SUPPORTED;
   }
-  return smb_protocol_build_header_response(ctx, response, response_capacity, status, status == STATUS_SUCCESS ? 2 : 0, response_length);
+  if (smb_protocol_build_header_response(ctx, response, response_capacity, status,
+      status == STATUS_SUCCESS ? 2 : 0, response_length) != 0)
+  {
+    return -ENOMEM;
+  }
+  if (status == STATUS_SUCCESS)
+  {
+    smb2_put_u16_le(response + SMB2_HEADER_SIZE, 2);
+  }
+  return 0;
 }
 
 //-- Convert Unix time to Windows FILETIME (100-nanosecond intervals since 1601-01-01)
@@ -734,6 +762,49 @@ static uint64_t smb_protocol_unix_to_filetime(time_t unix_time)
   //-- Difference: 116444736000000000 (100-ns intervals)
   const uint64_t EPOCH_DIFF = 116444736000000000ULL;
   return (uint64_t)unix_time * 10000000ULL + EPOCH_DIFF;
+}
+
+//-- Case-insensitive DOS-style wildcard match ('*' and '?'), used to filter
+//-- QUERY_DIRECTORY entries against the client's search pattern (MS-SMB2 2.2.33).
+//-- Without this, SL_RETURN_SINGLE_ENTRY lookups for a specific filename
+//-- always return whatever readdir() yields first, so a client polling for
+//-- a particular file it hasn't seen yet spins forever.
+static bool smb_protocol_wildcard_match(const char *pattern, size_t pattern_len, const char *name)
+{
+  size_t name_len = strlen(name);
+  size_t pi = 0, ni = 0;
+  size_t star_pi = (size_t)-1, star_ni = 0;
+
+  while (ni < name_len)
+  {
+    char pc = (pi < pattern_len) ? pattern[pi] : 0;
+    char nc = name[ni];
+    if (pc >= 'A' && pc <= 'Z') pc += ('a' - 'A');
+    if (nc >= 'A' && nc <= 'Z') nc += ('a' - 'A');
+
+    if (pi < pattern_len && (pattern[pi] == '?' || pc == nc))
+    {
+      pi++;
+      ni++;
+    }
+    else if (pi < pattern_len && pattern[pi] == '*')
+    {
+      star_pi = pi++;
+      star_ni = ni;
+    }
+    else if (star_pi != (size_t)-1)
+    {
+      pi = star_pi + 1;
+      ni = ++star_ni;
+    }
+    else
+    {
+      return false;
+    }
+  }
+  while (pi < pattern_len && pattern[pi] == '*')
+    pi++;
+  return pi == pattern_len;
 }
 
 static int smb_protocol_handle_query_directory(
@@ -768,6 +839,29 @@ static int smb_protocol_handle_query_directory(
 
   bool single_entry_only = (flags & SL_RETURN_SINGLE_ENTRY) != 0;
 
+  //-- Decode the client's search pattern (UTF-16LE, MS-SMB2 2.2.33) so entries
+  //-- not matching it can be skipped instead of always returning the first
+  //-- readdir() result.
+  char search_pattern[128] = {0};
+  size_t search_pattern_len = 0;
+  const uint8_t *pattern_utf16 = NULL;
+  if (req->file_name_length > 0 &&
+      smb_protocol_variable_data(request, request_length, req->file_name_offset, req->file_name_length, &pattern_utf16) == 0)
+  {
+    search_pattern_len = req->file_name_length / 2;
+    if (search_pattern_len > sizeof(search_pattern) - 1)
+      search_pattern_len = sizeof(search_pattern) - 1;
+    for (size_t i = 0; i < search_pattern_len; i++)
+      search_pattern[i] = (char)pattern_utf16[i * 2];
+    search_pattern[search_pattern_len] = 0;
+  }
+
+  //-- No pattern, or the "match everything" wildcard: skip filtering entirely
+  bool match_all = (search_pattern_len == 0) ||
+    (search_pattern_len == 1 && search_pattern[0] == '*');
+
+  ESP_LOGI(TAG, "QUERY_DIRECTORY: search_pattern='%s'", search_pattern);
+
   uint8_t *buffer = response + SMB2_HEADER_SIZE + 8;
   size_t buffer_size = response_capacity - SMB2_HEADER_SIZE - 8;
   size_t buffer_used = 0;
@@ -787,6 +881,9 @@ static int smb_protocol_handle_query_directory(
     ESP_LOGI(TAG, "QUERY_DIRECTORY: readdir -> '%s'", entry->d_name);
     size_t name_len = strlen(entry->d_name);
     if (name_len > 127)
+      continue;
+
+    if (!match_all && !smb_protocol_wildcard_match(search_pattern, search_pattern_len, entry->d_name))
       continue;
 
     //-- Calculate UTF-16LE length (2 bytes per ASCII char + 2 for null)
@@ -837,7 +934,7 @@ static int smb_protocol_handle_query_directory(
     uint64_t alloc_size = ((st.st_size + 4095) / 4096) * 4096;
     smb2_put_u64_le(entry_ptr + 48, alloc_size);
 
-    uint32_t attrs = S_ISDIR(st.st_mode) ? 0x10 : 0;
+    uint32_t attrs = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
     smb2_put_u32_le(entry_ptr + 56, attrs);
     smb2_put_u32_le(entry_ptr + 60, file_name_utf16_len - 2);
     smb2_put_u32_le(entry_ptr + 64, 0);
@@ -857,6 +954,12 @@ static int smb_protocol_handle_query_directory(
     fname_ptr[name_len * 2] = 0;
     fname_ptr[name_len * 2 + 1] = 0;
 
+    //-- Zero the 8-byte alignment gap after the filename so no leftover
+    //-- data from a previous response (response_buffer is reused, not
+    //-- cleared, across requests) is sent as unspecified padding.
+    if (next_entry_aligned > entry_size)
+      memset(entry_ptr + entry_size, 0, next_entry_aligned - entry_size);
+
     prev_entry_offset = buffer_used;
     prev_entry_aligned_size = next_entry_aligned;
 
@@ -871,12 +974,17 @@ static int smb_protocol_handle_query_directory(
   if (buffer_used == 0)
     return smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_NO_MORE_FILES, 0, response_length);
 
-  if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 8 + buffer_used, response_length) != 0)
+  //-- body_length=0: the directory entries are already written into the
+  //-- buffer above; passing the real body length here would make
+  //-- smb_protocol_build_header_response() memset() that region back to
+  //-- zero right after we filled it.
+  if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS, 0, response_length) != 0)
     return -ENOMEM;
 
   smb2_put_u16_le(response + SMB2_HEADER_SIZE, 9);
   smb2_put_u16_le(response + SMB2_HEADER_SIZE + 2, SMB2_HEADER_SIZE + 8);
   smb2_put_u32_le(response + SMB2_HEADER_SIZE + 4, (uint32_t)buffer_used);
+  *response_length = SMB2_HEADER_SIZE + 8 + buffer_used;
 
   return 0;
 }
@@ -1726,9 +1834,21 @@ static void smb_protocol_client_handler(void *arg)
     return;
   }
 
+  //-- Bytes already sitting in request_buffer[0..buffered_len) that belong
+  //-- to a NetBIOS frame which hasn't fully arrived yet. Must survive across
+  //-- recv() calls; a frame split over two TCP segments would otherwise be
+  //-- discarded (see the "Incomplete trailing NetBIOS frame" case below).
+  size_t buffered_len = 0;
+
   while (1)
   {
-    ssize_t bytes_read = recv(client_socket, request_buffer, BUFFER_SIZE, 0);
+    if (buffered_len == BUFFER_SIZE)
+    {
+      ESP_LOGE(TAG, "NetBIOS frame exceeds buffer size (%d bytes); disconnecting", BUFFER_SIZE);
+      break;
+    }
+
+    ssize_t bytes_read = recv(client_socket, request_buffer + buffered_len, BUFFER_SIZE - buffered_len, 0);
     if (bytes_read <= 0)
     {
       ESP_LOGI(TAG, "Client disconnected (bytes_read=%zd)", bytes_read);
@@ -1736,7 +1856,9 @@ static void smb_protocol_client_handler(void *arg)
     }
 
     ESP_LOGD(TAG, "Received %zd bytes from client", bytes_read);
-    smb_protocol_dump_packet("Request", request_buffer, (size_t)bytes_read);
+    smb_protocol_dump_packet("Request", request_buffer + buffered_len, (size_t)bytes_read);
+
+    buffered_len += (size_t)bytes_read;
 
     //-- A single recv() may coalesce multiple NetBIOS-framed SMB2 messages
     //-- (e.g. Finder pipelining CREATE+CLOSE immediately followed by
@@ -1747,16 +1869,16 @@ static void smb_protocol_client_handler(void *arg)
     size_t frame_offset = 0;
     bool disconnect = false;
 
-    while (frame_offset + 4 <= (size_t)bytes_read)
+    while (frame_offset + 4 <= buffered_len)
     {
       const uint8_t *frame = request_buffer + frame_offset;
       uint32_t netbios_length = ((uint32_t)frame[1] << 16) | ((uint32_t)frame[2] << 8) | frame[3];
       size_t frame_total = 4 + netbios_length;
 
-      if (frame_offset + frame_total > (size_t)bytes_read)
+      if (frame_offset + frame_total > buffered_len)
       {
-        ESP_LOGW(TAG, "Incomplete trailing NetBIOS frame (%zu bytes available, %zu needed); discarding",
-          (size_t)bytes_read - frame_offset, frame_total);
+        ESP_LOGD(TAG, "Incomplete trailing NetBIOS frame (%zu bytes available, %zu needed); waiting for more",
+          buffered_len - frame_offset, frame_total);
         break;
       }
 
@@ -1809,6 +1931,15 @@ static void smb_protocol_client_handler(void *arg)
 
     if (disconnect)
       break;
+
+    //-- Keep any leftover partial frame at the front of the buffer so the
+    //-- next recv() can append to it instead of overwriting it.
+    size_t leftover = buffered_len - frame_offset;
+    if (leftover > 0 && frame_offset > 0)
+    {
+      memmove(request_buffer, request_buffer + frame_offset, leftover);
+    }
+    buffered_len = leftover;
   }
 
   smb_session_reset();

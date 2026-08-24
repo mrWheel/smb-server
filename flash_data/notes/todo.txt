@@ -1,4 +1,0 @@
-- Try creating a new folder from your WebDAV client.
-- Drag a file in.
-- Rename it.
-- Delete this file.
