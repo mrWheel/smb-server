@@ -64,15 +64,264 @@ static void smb_protocol_dump_packet(const char *label, const uint8_t *data, siz
   }
 }
 
+//-- Each connection may have multiple trees open at once (e.g. two IPC$
+//-- connects before the disk share connect); MS-SMB2 requires every open
+//-- tree_id to be unique within a session, so a single global flag cannot
+//-- represent this correctly.
+#define SMB_SERVER_MAX_TREES 4
+
+typedef struct
+{
+  uint32_t tree_id;
+  bool in_use;
+  bool is_ipc;
+} smb_protocol_tree_t;
+
 //-- Protocol state machine
 typedef struct
 {
   int socket;
   uint64_t message_id;
   bool session_setup_started;
-  bool ipc_tree;
+  smb_protocol_tree_t trees[SMB_SERVER_MAX_TREES];
+  uint32_t next_tree_id;
   smb2_header_t last_request_header;
 } smb_protocol_context_t;
+
+//-- Look up the tree slot for tree_id; NULL if not currently open.
+static smb_protocol_tree_t *smb_protocol_find_tree(smb_protocol_context_t *ctx, uint32_t tree_id)
+{
+  for (int i = 0; i < SMB_SERVER_MAX_TREES; i++)
+  {
+    if (ctx->trees[i].in_use && ctx->trees[i].tree_id == tree_id)
+    {
+      return &ctx->trees[i];
+    }
+  }
+  return NULL;
+}
+
+//-- True only if the CURRENT request's tree_id maps to an open IPC$ tree.
+static bool smb_protocol_is_ipc_tree(smb_protocol_context_t *ctx, uint32_t tree_id)
+{
+  smb_protocol_tree_t *tree = smb_protocol_find_tree(ctx, tree_id);
+  return tree != NULL && tree->is_ipc;
+}
+
+//-- Pending SMB2_CHANGE_NOTIFY watches. A small fixed table, same pattern as
+//-- the tree table above: linear scan under a dedicated mutex. Each watch is
+//-- registered by CHANGE_NOTIFY (interim STATUS_PENDING reply) and completed
+//-- later by the owning connection's own recv-timeout tick once CREATE/CLOSE
+//-- elsewhere fires a matching event.
+#define SMB_SERVER_MAX_NOTIFY_WATCHES 8
+#define SMB_SERVER_NOTIFY_NAME_MAX 64
+
+typedef struct
+{
+  bool in_use;
+  int socket;
+  uint64_t file_id;
+  char watched_path[SMB_SERVER_PATH_MAX];
+  bool watch_tree;
+  uint32_t completion_filter;
+  uint64_t message_id;
+  uint64_t session_id;
+  uint64_t async_id;
+  bool fired;                //-- false = still pending; true once result_status is valid
+  uint32_t result_status;   //-- valid once fired: STATUS_SUCCESS or STATUS_CANCELLED
+  uint32_t action;
+  char name[SMB_SERVER_NOTIFY_NAME_MAX];
+} smb_protocol_notify_watch_t;
+
+static smb_protocol_notify_watch_t s_notify_watches[SMB_SERVER_MAX_NOTIFY_WATCHES];
+static SemaphoreHandle_t s_notify_mutex;
+static uint64_t s_next_async_id = 1;   //-- AsyncId must be nonzero (MS-SMB2)
+
+static SemaphoreHandle_t smb_protocol_notify_get_mutex(void)
+{
+  if (s_notify_mutex == NULL)
+  {
+    s_notify_mutex = xSemaphoreCreateMutex();
+  }
+
+  return s_notify_mutex;
+}
+
+//-- Splits a resolved VFS path at its last '/' into a parent directory and a
+//-- leaf name. parent_out never has a trailing slash (except for root "/").
+static void smb_protocol_split_parent_and_name(
+  const char *path, char *parent_out, size_t parent_out_size, const char **name_out)
+{
+  const char *slash = strrchr(path, '/');
+  if (slash == NULL)
+  {
+    strlcpy(parent_out, "/", parent_out_size);
+    *name_out = path;
+    return;
+  }
+
+  size_t parent_length = (size_t)(slash - path);
+  if (parent_length == 0)
+  {
+    parent_length = 1;  //-- keep the leading '/'
+  }
+  if (parent_length >= parent_out_size)
+  {
+    parent_length = parent_out_size - 1;
+  }
+  memcpy(parent_out, path, parent_length);
+  parent_out[parent_length] = '\0';
+  *name_out = slash + 1;
+}
+
+//-- Registers a new pending watch; returns ESP_ERR_NO_MEM if the table is full.
+static esp_err_t smb_protocol_notify_register(
+  int socket, uint64_t file_id, const char *watched_path, bool watch_tree,
+  uint32_t completion_filter, uint64_t message_id, uint64_t session_id, uint64_t *async_id_out)
+{
+  SemaphoreHandle_t mutex = smb_protocol_notify_get_mutex();
+  if (mutex == NULL || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+  {
+    return ESP_ERR_NO_MEM;
+  }
+
+  for (size_t index = 0; index < SMB_SERVER_MAX_NOTIFY_WATCHES; index++)
+  {
+    if (s_notify_watches[index].in_use)
+    {
+      continue;
+    }
+
+    smb_protocol_notify_watch_t *watch = &s_notify_watches[index];
+    memset(watch, 0, sizeof(*watch));
+    watch->in_use = true;
+    watch->socket = socket;
+    watch->file_id = file_id;
+    strlcpy(watch->watched_path, watched_path, sizeof(watch->watched_path));
+    watch->watch_tree = watch_tree;
+    watch->completion_filter = completion_filter;
+    watch->message_id = message_id;
+    watch->session_id = session_id;
+    watch->async_id = s_next_async_id++;
+    watch->fired = false;
+    watch->result_status = 0;
+    *async_id_out = watch->async_id;
+    xSemaphoreGive(mutex);
+    return ESP_OK;
+  }
+
+  xSemaphoreGive(mutex);
+  return ESP_ERR_NO_MEM;
+}
+
+//-- Marks every still-pending watch whose watched_path matches changed_dir_path
+//-- (exact match, or an ancestor match when watch_tree is set) as fired.
+static void smb_protocol_notify_fire(const char *changed_dir_path, uint32_t action, const char *name)
+{
+  SemaphoreHandle_t mutex = smb_protocol_notify_get_mutex();
+  if (mutex == NULL || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+  {
+    return;
+  }
+
+  size_t changed_dir_length = strlen(changed_dir_path);
+
+  for (size_t index = 0; index < SMB_SERVER_MAX_NOTIFY_WATCHES; index++)
+  {
+    smb_protocol_notify_watch_t *watch = &s_notify_watches[index];
+    if (!watch->in_use || watch->fired)
+    {
+      continue;
+    }
+
+    bool matches = strcmp(watch->watched_path, changed_dir_path) == 0;
+    if (!matches && watch->watch_tree)
+    {
+      size_t watched_length = strlen(watch->watched_path);
+      matches = changed_dir_length > watched_length &&
+        strncmp(changed_dir_path, watch->watched_path, watched_length) == 0 &&
+        (watch->watched_path[watched_length - 1] == '/' || changed_dir_path[watched_length] == '/');
+    }
+
+    if (!matches)
+    {
+      continue;
+    }
+
+    watch->action = action;
+    strlcpy(watch->name, name, sizeof(watch->name));
+    watch->result_status = STATUS_SUCCESS;
+    watch->fired = true;
+  }
+
+  xSemaphoreGive(mutex);
+}
+
+//-- Marks a pending watch cancelled (SMB2_CANCEL); the owning connection's
+//-- poll tick will send the STATUS_CANCELLED final response and free the slot.
+static void smb_protocol_notify_cancel(uint64_t async_id)
+{
+  SemaphoreHandle_t mutex = smb_protocol_notify_get_mutex();
+  if (mutex == NULL || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+  {
+    return;
+  }
+
+  for (size_t index = 0; index < SMB_SERVER_MAX_NOTIFY_WATCHES; index++)
+  {
+    smb_protocol_notify_watch_t *watch = &s_notify_watches[index];
+    if (watch->in_use && watch->async_id == async_id && !watch->fired)
+    {
+      watch->result_status = STATUS_CANCELLED;
+      watch->fired = true;
+      break;
+    }
+  }
+
+  xSemaphoreGive(mutex);
+}
+
+//-- Frees any watch registered against this directory handle (CLOSE of the
+//-- watched handle itself invalidates the watch; MS-SMB2 has no async
+//-- completion for that case, so it is simply dropped rather than notified).
+static void smb_protocol_notify_release_by_file_id(uint64_t file_id)
+{
+  SemaphoreHandle_t mutex = smb_protocol_notify_get_mutex();
+  if (mutex == NULL || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+  {
+    return;
+  }
+
+  for (size_t index = 0; index < SMB_SERVER_MAX_NOTIFY_WATCHES; index++)
+  {
+    if (s_notify_watches[index].in_use && s_notify_watches[index].file_id == file_id)
+    {
+      memset(&s_notify_watches[index], 0, sizeof(s_notify_watches[index]));
+    }
+  }
+
+  xSemaphoreGive(mutex);
+}
+
+//-- Frees every watch owned by a connection (disconnect/TREE_DISCONNECT/LOGOFF cleanup).
+static void smb_protocol_notify_release_by_socket(int socket)
+{
+  SemaphoreHandle_t mutex = smb_protocol_notify_get_mutex();
+  if (mutex == NULL || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+  {
+    return;
+  }
+
+  for (size_t index = 0; index < SMB_SERVER_MAX_NOTIFY_WATCHES; index++)
+  {
+    if (s_notify_watches[index].in_use && s_notify_watches[index].socket == socket)
+    {
+      memset(&s_notify_watches[index], 0, sizeof(s_notify_watches[index]));
+    }
+  }
+
+  xSemaphoreGive(mutex);
+}
 
 static uint32_t smb_protocol_status_from_errno(int error_number)
 {
@@ -118,6 +367,16 @@ static int smb_protocol_build_header_response(
   size_t body_length,
   size_t *response_length)
 {
+  //-- MS-SMB2 2.2.2: a non-success response must carry the minimal 8-byte
+  //-- Error Response body (StructureSize=9, ErrorContextCount, Reserved,
+  //-- ByteCount=0). Omitting it (header-only, 64 bytes) is tolerated by
+  //-- macOS but desyncs iOS's stricter SMB2 client ("Data loop, have N
+  //-- bytes, need 72" as it waits for the missing 8-byte tail).
+  if (status != STATUS_SUCCESS && body_length < 8)
+  {
+    body_length = 8;
+  }
+
   if (response_capacity < SMB2_HEADER_SIZE + body_length)
   {
     return -ENOMEM;
@@ -135,6 +394,10 @@ static int smb_protocol_build_header_response(
   header.session_id = ctx->last_request_header.session_id;
   smb2_build_header(response, response_capacity, &header);
   memset(response + SMB2_HEADER_SIZE, 0, body_length);
+  if (status != STATUS_SUCCESS)
+  {
+    smb2_put_u16_le(response + SMB2_HEADER_SIZE, 9);  //-- structure_size
+  }
   *response_length = SMB2_HEADER_SIZE + body_length;
   return 0;
 }
@@ -296,7 +559,7 @@ static int smb_protocol_handle_create(
     return -EINVAL;
   }
 
-  if (ctx->ipc_tree && strcasecmp(smb_name, "srvsvc") == 0)
+  if (smb_protocol_is_ipc_tree(ctx, ctx->last_request_header.tree_id) && strcasecmp(smb_name, "srvsvc") == 0)
   {
     uint64_t smb_file_id = 0;
     if (smb_session_allocate_pipe(&smb_file_id) != ESP_OK)
@@ -395,7 +658,10 @@ static int smb_protocol_handle_create(
     if (disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF || disposition == FILE_SUPERSEDE)
     {
       flags |= O_TRUNC;
-      create_action = 3;
+      if (exists)
+      {
+        create_action = 3;
+      }
     }
     if (!g_smb_server_state.config.read_only)
     {
@@ -431,6 +697,14 @@ static int smb_protocol_handle_create(
     {
       handle->delete_pending = true;
     }
+  }
+
+  if (create_action == 2)
+  {
+    char parent[SMB_SERVER_PATH_MAX];
+    const char *leaf = NULL;
+    smb_protocol_split_parent_and_name(path, parent, sizeof(parent), &leaf);
+    smb_protocol_notify_fire(parent, FILE_ACTION_ADDED, leaf);
   }
 
   if (smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_SUCCESS,
@@ -479,6 +753,7 @@ static int smb_protocol_handle_close(
     //-- Release the handle (closes the underlying fd/dir) before deleting;
     //-- esp_littlefs refuses to unlink a path that still has an open FD.
     smb_session_release(file_id);
+    smb_protocol_notify_release_by_file_id(file_id);
 
     if (delete_pending)
     {
@@ -486,6 +761,13 @@ static int smb_protocol_handle_close(
       if (result != 0)
       {
         status = smb_protocol_status_from_errno(errno);
+      }
+      else
+      {
+        char parent[SMB_SERVER_PATH_MAX];
+        const char *leaf = NULL;
+        smb_protocol_split_parent_and_name(path, parent, sizeof(parent), &leaf);
+        smb_protocol_notify_fire(parent, FILE_ACTION_REMOVED, leaf);
       }
       //-- Keep the pre-delete stat captured above; macOS rejects an
       //-- all-zero-attribute CLOSE response even for a deleted file.
@@ -753,6 +1035,68 @@ static int smb_protocol_handle_set_info(
     smb2_put_u16_le(response + SMB2_HEADER_SIZE, 2);
   }
   return 0;
+}
+
+//-- SMB2_CHANGE_NOTIFY (0x0f). Registers a pending watch on the given
+//-- directory handle and replies immediately with the MS-SMB2 interim
+//-- STATUS_PENDING async response; the real (final) response is sent later
+//-- by smb_protocol_notify_poll() once a matching change fires or the
+//-- request is cancelled.
+static int smb_protocol_handle_change_notify(
+  smb_protocol_context_t *ctx, const uint8_t *request, size_t request_length,
+  uint8_t *response, size_t response_capacity, size_t *response_length)
+{
+  #define SMB2_WATCH_TREE 0x0001
+
+  if (request_length < sizeof(smb2_change_notify_request_t)) return -EINVAL;
+  const smb2_change_notify_request_t *req = (const smb2_change_notify_request_t *)request;
+
+  smb_session_handle_t *handle = NULL;
+  if (smb_session_lookup(smb_protocol_get_file_id(req->file_id), &handle) != ESP_OK || !handle->is_directory)
+    return smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_INVALID_PARAMETER, 0, response_length);
+
+  char watched_path[SMB_SERVER_PATH_MAX];
+  strlcpy(watched_path, handle->path, sizeof(watched_path));
+
+  uint16_t flags = smb2_get_u16_le((const uint8_t *)&req->flags);
+  uint32_t completion_filter = smb2_get_u32_le((const uint8_t *)&req->completion_filter);
+
+  uint64_t async_id = 0;
+  esp_err_t register_result = smb_protocol_notify_register(
+    ctx->socket, smb_protocol_get_file_id(req->file_id), watched_path,
+    (flags & SMB2_WATCH_TREE) != 0, completion_filter,
+    ctx->last_request_header.message_id, ctx->last_request_header.session_id, &async_id);
+
+  if (register_result != ESP_OK)
+    return smb_protocol_build_header_response(ctx, response, response_capacity, STATUS_INSUFFICIENT_RESOURCES, 0, response_length);
+
+  //-- Interim response: built by hand rather than via smb_protocol_build_header_response(),
+  //-- which always treats bytes 32-39 as a sync reserved+tree_id pair. Here those same
+  //-- wire bytes carry the async AsyncId instead (confirmed in smb_packet.c's header codec).
+  if (response_capacity < SMB2_HEADER_SIZE + 8)
+  {
+    return -ENOMEM;
+  }
+
+  smb2_header_t header = {0};
+  header.signature = SMB2_SIGNATURE;
+  header.structure_size = SMB2_HEADER_SIZE;
+  header.credit_requested = smb_protocol_grant_credits(ctx);
+  header.command = ctx->last_request_header.command;
+  header.flags = SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND;
+  header.status = STATUS_PENDING;
+  header.message_id = ctx->last_request_header.message_id;
+  header.reserved = (uint32_t)(async_id & 0xffffffffu);
+  header.tree_id = (uint32_t)(async_id >> 32);
+  header.session_id = ctx->last_request_header.session_id;
+  smb2_build_header(response, response_capacity, &header);
+
+  memset(response + SMB2_HEADER_SIZE, 0, 8);
+  smb2_put_u16_le(response + SMB2_HEADER_SIZE, 9);  //-- structure_size (SMB2 Error Response)
+  *response_length = SMB2_HEADER_SIZE + 8;
+  return 0;
+
+  #undef SMB2_WATCH_TREE
 }
 
 //-- Convert Unix time to Windows FILETIME (100-nanosecond intervals since 1601-01-01)
@@ -1261,8 +1605,12 @@ static int smb_protocol_handle_negotiate(
     for (uint16_t index = 0; index < dialect_count; index++)
     {
       uint16_t dialect = smb2_get_u16_le(dialects + (size_t)index * sizeof(uint16_t));
+      //-- Log every raw offered dialect so we can see values our accept-list
+      //-- silently drops (e.g. 0x0311), instead of guessing blind again.
+      ESP_LOGI(TAG, "  offered dialect[%u] = 0x%04x", index, dialect);
         if (dialect == SMB2_DIALECT_202 || dialect == SMB2_DIALECT_210 ||
-          dialect == SMB2_DIALECT_300 || dialect == SMB2_DIALECT_302)
+          dialect == SMB2_DIALECT_300 || dialect == SMB2_DIALECT_302 ||
+          dialect == SMB2_DIALECT_2FF)
       {
         if (dialect > selected_dialect)
         {
@@ -1272,7 +1620,8 @@ static int smb_protocol_handle_negotiate(
     }
   }
 
-  ESP_LOGI(TAG, "Client offered %u dialects (request body: %zu bytes)", dialect_count, request_length);
+  ESP_LOGI(TAG, "Client offered %u dialects (request body: %zu bytes), selected 0x%04x",
+    dialect_count, request_length, selected_dialect);
 
   //-- Build negotiate response
   if (response_capacity < SMB2_HEADER_SIZE + 64)
@@ -1365,17 +1714,25 @@ static int smb_protocol_handle_legacy_negotiate(
     return -ENOTSUP;
   }
 
+  //-- Reply with the SMB2 wildcard dialect (0x02FF), not a committed dialect.
+  //-- This is the standard multi-protocol-negotiate handshake: it tells the
+  //-- client "I support SMB2, send a real NEGOTIATE with your dialect list"
+  //-- so it can pick a modern dialect. Committing directly to 0x0202 here
+  //-- pins every connection to the oldest SMB2 dialect, which Apple clients
+  //-- accept for anonymous share browsing (IPC$) but refuse for real file
+  //-- data access -- they silently abandon the connection right after a
+  //-- successful TREE_CONNECT to an actual disk share.
   uint8_t negotiate_request[sizeof(smb2_negotiate_request_t) + sizeof(uint16_t)] = {0};
   smb2_put_u16_le(negotiate_request, 36);
   smb2_put_u16_le(negotiate_request + 2, 1);
-  smb2_put_u16_le(negotiate_request + sizeof(smb2_negotiate_request_t), SMB2_DIALECT_202);
+  smb2_put_u16_le(negotiate_request + sizeof(smb2_negotiate_request_t), SMB2_DIALECT_2FF);
 
   memset(&ctx->last_request_header, 0, sizeof(ctx->last_request_header));
   ctx->last_request_header.signature = SMB2_SIGNATURE;
   ctx->last_request_header.command = SMB2_NEGOTIATE;
   ctx->last_request_header.message_id = smb2_get_u16_le(request + 31);
 
-  ESP_LOGI(TAG, "SMB1 negotiate offered SMB2; continuing with SMB2 dialect 0x0202");
+  ESP_LOGI(TAG, "SMB1 negotiate offered SMB2; replying with wildcard dialect 0x02ff");
   return smb_protocol_handle_negotiate(
     ctx,
     negotiate_request,
@@ -1395,6 +1752,11 @@ static int smb_protocol_handle_session_setup(
 {
   ESP_LOGI(TAG, "Session Setup request: %zu bytes", request_length);
 
+  //-- Some clients (macOS mount_smbfs, "Filer") send a bare, unwrapped
+  //-- NTLMSSP negotiate token; others (iOS "Files") send it wrapped in a
+  //-- SPNEGO/GSS-API NegTokenInit envelope and reject an unwrapped reply.
+  //-- Mirror whichever form the client itself used.
+  bool client_sent_bare_ntlmssp = false;
   if (request_length >= 16)
   {
     uint16_t security_buffer_offset = smb2_get_u16_le(request + 12);
@@ -1410,34 +1772,69 @@ static int smb_protocol_handle_session_setup(
         "Session Setup security token",
         request + security_buffer_start,
         security_buffer_length);
+      //-- See exactly which container (bare NTLMSSP vs SPNEGO NegTokenInit)
+      //-- this client actually sent, without needing a packet capture.
+      ESP_LOG_BUFFER_HEXDUMP(TAG, request + security_buffer_start, security_buffer_length, ESP_LOG_INFO);
+      client_sent_bare_ntlmssp = security_buffer_length >= 8 &&
+        memcmp(request + security_buffer_start, "NTLMSSP\0", 8) == 0;
     }
   }
 
   //-- Accept all session setup requests (guest access)
   //-- Minimal validation; client may send partial requests
-   static const uint8_t ntlm_challenge[] =
-     {
-     0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00,
-     0x02, 0x00, 0x00, 0x00,
-     0x0a, 0x00, 0x0a, 0x00, 0x30, 0x00, 0x00, 0x00,
-     0x05, 0x02, 0x88, 0x62,
-     0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-     0x24, 0x00, 0x24, 0x00, 0x3a, 0x00, 0x00, 0x00,
-     0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
-     0x01, 0x00, 0x0a, 0x00, 0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
-     0x02, 0x00, 0x00, 0x00,
-     0x03, 0x00, 0x0a, 0x00, 0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
-     0x00, 0x00, 0x00, 0x00
-     };
+  //-- The NTLM challenge message must be wrapped in a SPNEGO/GSS-API
+  //-- NegTokenResp ASN.1 envelope for clients (iOS "Files") that sent a
+  //-- SPNEGO-wrapped negotiate token; clients that sent a bare NTLMSSP
+  //-- token (macOS mount_smbfs, "Filer") get the same 94-byte NTLM
+  //-- Challenge message back unwrapped instead (see ntlm_challenge_raw
+  //-- below, identical bytes to the responseToken embedded here).
+  static const uint8_t spnego_challenge[] =
+    {
+    0xa1, 0x77,                                                  //-- [1] NegTokenResp
+      0x30, 0x75,                                                //--   SEQUENCE
+        0xa0, 0x03, 0x0a, 0x01, 0x01,                            //--     [0] negState: accept-incomplete(1)
+        0xa1, 0x0c, 0x06, 0x0a,                                  //--     [1] supportedMech
+          0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,  //--       OID 1.3.6.1.4.1.311.2.2.10 (NTLMSSP)
+        0xa2, 0x60, 0x04, 0x5e,                                  //--     [2] responseToken OCTET STRING (94 bytes)
+          0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00,
+          0x02, 0x00, 0x00, 0x00,
+          0x0a, 0x00, 0x0a, 0x00, 0x30, 0x00, 0x00, 0x00,
+          0x05, 0x02, 0x88, 0x62,
+          0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x24, 0x00, 0x24, 0x00, 0x3a, 0x00, 0x00, 0x00,
+          0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
+          0x01, 0x00, 0x0a, 0x00, 0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
+          0x02, 0x00, 0x00, 0x00,
+          0x03, 0x00, 0x0a, 0x00, 0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
+          0x00, 0x00, 0x00, 0x00
+    };
+  //-- Same NTLM Type-2 Challenge message as the responseToken above, sent
+  //-- unwrapped for clients that themselves sent a bare NTLMSSP token.
+  static const uint8_t ntlm_challenge_raw[] =
+    {
+    0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00,
+    0x02, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x0a, 0x00, 0x30, 0x00, 0x00, 0x00,
+    0x05, 0x02, 0x88, 0x62,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x24, 0x00, 0x24, 0x00, 0x3a, 0x00, 0x00, 0x00,
+    0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
+    0x01, 0x00, 0x0a, 0x00, 0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
+    0x02, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x0a, 0x00, 0x45, 0x00, 0x53, 0x00, 0x50, 0x00, 0x33, 0x00, 0x32, 0x00,
+    0x00, 0x00, 0x00, 0x00
+    };
   static const uint8_t guest_spnego_complete[] =
     { 0xa1, 0x03, 0x0a, 0x01, 0x00 };
   bool first_session_setup = !ctx->session_setup_started;
   const uint8_t *security_token = first_session_setup ?
-    ntlm_challenge : guest_spnego_complete;
+    (client_sent_bare_ntlmssp ? ntlm_challenge_raw : spnego_challenge) :
+    guest_spnego_complete;
   const size_t security_token_length = first_session_setup ?
-    sizeof(ntlm_challenge) : 0;
-  const size_t security_token_offset = SMB2_HEADER_SIZE + 9;
+    (client_sent_bare_ntlmssp ? sizeof(ntlm_challenge_raw) : sizeof(spnego_challenge)) : 0;
+  const size_t security_token_offset = SMB2_HEADER_SIZE + 8;  //-- fixed body is 8 bytes; 9 is the declared StructureSize value, not a byte offset
   if (response_capacity < security_token_offset + security_token_length)
   {
     return -ENOMEM;
@@ -1471,6 +1868,9 @@ static int smb_protocol_handle_session_setup(
   *response_length = security_token_offset + security_token_length;
   ESP_LOGI(TAG, "Session Setup response: %zu bytes, status=0x%08x, session_id=0x%llx",
     *response_length, resp_header.status, resp_header.session_id);
+  //-- Dump the exact outgoing bytes so the SPNEGO/NTLM challenge can be
+  //-- diffed byte-for-byte against the spec without needing a packet capture.
+  ESP_LOG_BUFFER_HEXDUMP(TAG, response, *response_length, ESP_LOG_INFO);
 
   return 0;
 }
@@ -1493,18 +1893,49 @@ static int smb_protocol_handle_tree_connect(
   {
     smb_path_utf16le_to_utf8(path_data, path_length, tree_path, sizeof(tree_path));
   }
-  ctx->ipc_tree = strcasestr(tree_path, "IPC$") != NULL;
-  ESP_LOGI(TAG, "Tree Connect path='%s' ipc=%s", tree_path, ctx->ipc_tree ? "yes" : "no");
+  bool is_ipc = strcasestr(tree_path, "IPC$") != NULL;
+  ESP_LOGI(TAG, "Tree Connect path='%s' ipc=%s", tree_path, is_ipc ? "yes" : "no");
 
   //-- Validate share path
   uint32_t status = STATUS_SUCCESS;
-  if (!ctx->ipc_tree)
+  if (!is_ipc)
   {
     //-- For disk shares, path MUST contain the share name (ESP32)
     if (strcasestr(tree_path, g_smb_server_state.share_name) == NULL)
     {
       status = STATUS_OBJECT_NAME_NOT_FOUND;
       ESP_LOGI(TAG, "Tree Connect: share '%s' not found", tree_path);
+    }
+  }
+
+  //-- Allocate a free tree slot with a unique, never-reused tree_id; each
+  //-- concurrently-open tree within a session must have its own id so the
+  //-- client can track them independently (MS-SMB2 2.2.9).
+  uint32_t tree_id = 0;
+  if (status == STATUS_SUCCESS)
+  {
+    smb_protocol_tree_t *slot = NULL;
+    for (int i = 0; i < SMB_SERVER_MAX_TREES; i++)
+    {
+      if (!ctx->trees[i].in_use)
+      {
+        slot = &ctx->trees[i];
+        break;
+      }
+    }
+
+    if (slot == NULL)
+    {
+      status = STATUS_INSUFFICIENT_RESOURCES;
+      ESP_LOGW(TAG, "Tree Connect: no free tree slots (max %u)", SMB_SERVER_MAX_TREES);
+    }
+    else
+    {
+      if (++ctx->next_tree_id == 0) ctx->next_tree_id = 1;  //-- 0 is reserved/invalid
+      tree_id = ctx->next_tree_id;
+      slot->tree_id = tree_id;
+      slot->in_use = true;
+      slot->is_ipc = is_ipc;
     }
   }
 
@@ -1522,7 +1953,8 @@ static int smb_protocol_handle_tree_connect(
   resp_header.credit_requested = smb_protocol_grant_credits(ctx);
   resp_header.status = status;
   resp_header.message_id = ctx->last_request_header.message_id;
-  resp_header.tree_id = status == STATUS_SUCCESS ? 1 : 0;
+  resp_header.tree_id = tree_id;
+  resp_header.session_id = ctx->last_request_header.session_id;
 
   smb2_build_header(response, response_capacity, &resp_header);
 
@@ -1531,7 +1963,7 @@ static int smb_protocol_handle_tree_connect(
     //-- Build tree connect response body (starts after 64-byte header)
     uint8_t *resp_body = response + SMB2_HEADER_SIZE;
     smb2_put_u16_le(resp_body + 0, 16);  //-- structure_size
-    resp_body[2] = ctx->ipc_tree ? 2 : 1; //-- share_type (pipe or disk share)
+    resp_body[2] = is_ipc ? 2 : 1;       //-- share_type (pipe or disk share)
     resp_body[3] = 0;                    //-- reserved
     smb2_put_u32_le(resp_body + 4, 0);   //-- share_flags
     smb2_put_u32_le(resp_body + 8, 0);   //-- capabilities
@@ -1546,6 +1978,10 @@ static int smb_protocol_handle_tree_connect(
   }
 
   ESP_LOGI(TAG, "Tree Connect response: %zu bytes, status=0x%08x, tree_id=%u", *response_length, status, resp_header.tree_id);
+  //-- Dump the exact outgoing bytes so a working (IPC$) response can be
+  //-- diffed byte-for-byte against a failing (disk share) one from the log
+  //-- alone, without needing a packet capture.
+  ESP_LOG_BUFFER_HEXDUMP(TAG, response, *response_length, ESP_LOG_INFO);
 
   return 0;
 }
@@ -1562,6 +1998,7 @@ static int smb_protocol_related_file_id_offset(uint16_t command)
     case SMB2_QUERY_INFO:      return offsetof(smb2_query_info_request_t, file_id);
     case SMB2_SET_INFO:        return offsetof(smb2_set_info_request_t, file_id);
     case SMB2_QUERY_DIRECTORY: return offsetof(smb2_query_directory_request_t, file_id);
+    case SMB2_CHANGE_NOTIFY:   return offsetof(smb2_change_notify_request_t, file_id);
     default:                   return -1;
   }
 }
@@ -1723,6 +2160,25 @@ static int smb_protocol_process_request(
         result = smb_protocol_handle_query_directory(ctx, cmd_payload, cmd_payload_length, sub_response, sub_response_capacity, &sub_response_length);
         break;
 
+      case SMB2_CHANGE_NOTIFY:
+        result = smb_protocol_handle_change_notify(ctx, cmd_payload, cmd_payload_length, sub_response, sub_response_capacity, &sub_response_length);
+        break;
+
+      case SMB2_CANCEL:
+        //-- MS-SMB2 2.2.30: CANCEL never gets a response, sync or async. An
+        //-- async cancel (the only kind used by our pending CHANGE_NOTIFY
+        //-- watches) carries the target's AsyncId in this request's own
+        //-- header reserved/tree_id fields (same wire bytes as always).
+        if (ctx->last_request_header.flags & SMB2_FLAGS_ASYNC_COMMAND)
+        {
+          uint64_t async_id = (uint64_t)ctx->last_request_header.reserved |
+            ((uint64_t)ctx->last_request_header.tree_id << 32);
+          smb_protocol_notify_cancel(async_id);
+        }
+        ESP_LOGI(TAG, "Command 0x%02x: CANCEL (no response)", ctx->last_request_header.command);
+        sub_response_length = 0;
+        break;
+
       case SMB2_IOCTL:
         result = smb_protocol_handle_ioctl(ctx, cmd_payload, cmd_payload_length, sub_response, sub_response_capacity, &sub_response_length);
         break;
@@ -1731,10 +2187,27 @@ static int smb_protocol_process_request(
         result = smb_protocol_handle_echo(ctx, sub_response, sub_response_capacity, &sub_response_length);
         break;
 
-      case SMB2_LOGOFF:
       case SMB2_TREE_DISCONNECT:
+      {
+        smb_protocol_tree_t *tree = smb_protocol_find_tree(ctx, ctx->last_request_header.tree_id);
+        if (tree != NULL)
+        {
+          tree->in_use = false;
+        }
+        ESP_LOGI(TAG, "Tree Disconnect: tree_id=%u closed", ctx->last_request_header.tree_id);
+        [[fallthrough]];  //-- LOGOFF and TREE_DISCONNECT build the same header-only success response below.
+      }
+      case SMB2_LOGOFF:
         ESP_LOGI(TAG, "Command 0x%02x: OK (no-op)", ctx->last_request_header.command);
+        //-- LOGOFF ends the session; a later SESSION_SETUP on this same TCP
+        //-- connection is a brand-new leg-1 negotiate, not a continuation.
+        ctx->session_setup_started = false;
         smb_session_reset();
+        //-- Slots don't track tree_id, so TREE_DISCONNECT (which falls through
+        //-- to here) frees ALL of this connection's pending watches, not just
+        //-- ones on the disconnected tree (accepted deviation; only matters
+        //-- with two disk trees open at once).
+        smb_protocol_notify_release_by_socket(ctx->socket);
         {
           smb2_header_t *resp_header = (smb2_header_t *)sub_response;
           memset(resp_header, 0, sizeof(*resp_header));
@@ -1811,6 +2284,104 @@ static int smb_protocol_process_request(
   return result;
 }
 
+//-- Sends the final async response for one fired CHANGE_NOTIFY watch owned by
+//-- this connection, then frees its slot. Called repeatedly (once per fired
+//-- watch) from the client handler's recv-timeout tick.
+static void smb_protocol_notify_poll(smb_protocol_context_t *ctx, uint8_t *response_buffer, size_t buffer_capacity)
+{
+  while (1)
+  {
+    SemaphoreHandle_t mutex = smb_protocol_notify_get_mutex();
+    if (mutex == NULL || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE)
+    {
+      return;
+    }
+
+    uint64_t async_id = 0, message_id = 0, session_id = 0;
+    uint32_t result_status = 0, action = 0;
+    char name[SMB_SERVER_NOTIFY_NAME_MAX] = {0};
+    bool found = false;
+
+    for (size_t index = 0; index < SMB_SERVER_MAX_NOTIFY_WATCHES; index++)
+    {
+      smb_protocol_notify_watch_t *watch = &s_notify_watches[index];
+      if (watch->in_use && watch->socket == ctx->socket && watch->fired)
+      {
+        async_id = watch->async_id;
+        message_id = watch->message_id;
+        session_id = watch->session_id;
+        result_status = watch->result_status;
+        action = watch->action;
+        strlcpy(name, watch->name, sizeof(name));
+        memset(watch, 0, sizeof(*watch));
+        found = true;
+        break;
+      }
+    }
+
+    xSemaphoreGive(mutex);
+
+    if (!found)
+    {
+      return;
+    }
+
+    size_t name_utf16_len = (result_status == STATUS_SUCCESS) ? strlen(name) * 2 : 0;
+    size_t body_length = (result_status == STATUS_SUCCESS) ? (8 + 12 + name_utf16_len) : 8;
+
+    if (buffer_capacity < SMB2_HEADER_SIZE + body_length)
+    {
+      ESP_LOGW(TAG, "Notify response too large for buffer (%zu bytes); dropping", body_length);
+      continue;
+    }
+
+    smb2_header_t header = {0};
+    header.signature = SMB2_SIGNATURE;
+    header.structure_size = SMB2_HEADER_SIZE;
+    header.credit_requested = 0;  //-- final async responses grant no credits (MS-SMB2)
+    header.command = SMB2_CHANGE_NOTIFY;
+    header.flags = SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND;
+    header.status = result_status;
+    header.message_id = message_id;
+    header.reserved = (uint32_t)(async_id & 0xffffffffu);
+    header.tree_id = (uint32_t)(async_id >> 32);
+    header.session_id = session_id;
+    smb2_build_header(response_buffer, buffer_capacity, &header);
+
+    uint8_t *body = response_buffer + SMB2_HEADER_SIZE;
+    memset(body, 0, body_length);
+    smb2_put_u16_le(body, 9);  //-- structure_size (both the success and error shapes start with this)
+    if (result_status == STATUS_SUCCESS)
+    {
+      smb2_put_u16_le(body + 2, SMB2_HEADER_SIZE + 8);              //-- output_buffer_offset
+      smb2_put_u32_le(body + 4, (uint32_t)(12 + name_utf16_len));   //-- output_buffer_length
+      uint8_t *notify_info = body + 8;
+      smb2_put_u32_le(notify_info + 0, 0);  //-- next_entry_offset (single entry)
+      smb2_put_u32_le(notify_info + 4, action);
+      smb2_put_u32_le(notify_info + 8, (uint32_t)name_utf16_len);
+      uint8_t *fname = notify_info + 12;
+      for (size_t i = 0; i < strlen(name); i++)
+      {
+        fname[i * 2] = name[i];
+        fname[i * 2 + 1] = 0;
+      }
+    }
+
+    size_t response_length = SMB2_HEADER_SIZE + body_length;
+    uint8_t netbios_frame[4];
+    netbios_frame[0] = 0x00;
+    netbios_frame[1] = (uint8_t)((response_length >> 16) & 0xff);
+    netbios_frame[2] = (uint8_t)((response_length >> 8) & 0xff);
+    netbios_frame[3] = (uint8_t)(response_length & 0xff);
+
+    if (send(ctx->socket, netbios_frame, 4, 0) == 4)
+    {
+      send(ctx->socket, response_buffer, response_length, 0);
+    }
+    ESP_LOGI(TAG, "Sent CHANGE_NOTIFY final response: status=0x%08x action=%u name='%s'", result_status, action, name);
+  }
+}
+
 static void smb_protocol_client_handler(void *arg)
 {
   int client_socket = (intptr_t)arg;
@@ -1834,6 +2405,16 @@ static void smb_protocol_client_handler(void *arg)
     return;
   }
 
+  //-- Poll tick for pending CHANGE_NOTIFY watches: without this, a client
+  //-- with an outstanding watch and nothing else to say would leave recv()
+  //-- blocked forever, and a fired watch's final response would never be
+  //-- sent until the client happened to issue another request.
+  struct timeval notify_poll_timeout = { .tv_sec = 1, .tv_usec = 0 };
+  if (setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &notify_poll_timeout, sizeof(notify_poll_timeout)) < 0)
+  {
+    ESP_LOGW(TAG, "Failed to set SO_RCVTIMEO on client socket %d: errno=%d", client_socket, errno);
+  }
+
   //-- Bytes already sitting in request_buffer[0..buffered_len) that belong
   //-- to a NetBIOS frame which hasn't fully arrived yet. Must survive across
   //-- recv() calls; a frame split over two TCP segments would otherwise be
@@ -1849,6 +2430,11 @@ static void smb_protocol_client_handler(void *arg)
     }
 
     ssize_t bytes_read = recv(client_socket, request_buffer + buffered_len, BUFFER_SIZE - buffered_len, 0);
+    if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+    {
+      smb_protocol_notify_poll(&ctx, response_buffer, BUFFER_SIZE);
+      continue;
+    }
     if (bytes_read <= 0)
     {
       ESP_LOGI(TAG, "Client disconnected (bytes_read=%zd)", bytes_read);
@@ -1943,6 +2529,7 @@ static void smb_protocol_client_handler(void *arg)
   }
 
   smb_session_reset();
+  smb_protocol_notify_release_by_socket(client_socket);
   free(request_buffer);
   free(response_buffer);
   close(client_socket);

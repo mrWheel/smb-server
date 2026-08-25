@@ -18,6 +18,7 @@
 #define SMB2_DIALECT_300 0x0300
 #define SMB2_DIALECT_302 0x0302
 #define SMB2_DIALECT_311 0x0311
+#define SMB2_DIALECT_2FF 0x02ff  //-- Wildcard: "I support SMB2, send a real NEGOTIATE"
 
 //-- SMB2 Command Codes
 #define SMB2_NEGOTIATE 0x00
@@ -64,6 +65,8 @@
 #define STATUS_NOT_A_DIRECTORY 0xc0000103
 #define STATUS_NOT_SUPPORTED 0xc00000bb
 #define STATUS_NO_MORE_FILES 0x80000006
+#define STATUS_PENDING 0x00000103
+#define STATUS_CANCELLED 0xc0000120
 
 //-- SMB2 Session Setup response flags
 #define SMB2_SESSION_FLAG_IS_GUEST 0x0001
@@ -78,6 +81,13 @@
 
 //-- SMB2 Query Directory File Info Classes
 #define FileIdBothDirectoryInformation 37
+
+//-- SMB2/MS-FSCC File Notify Actions (2.7.1), used by CHANGE_NOTIFY responses
+#define FILE_ACTION_ADDED 0x00000001
+#define FILE_ACTION_REMOVED 0x00000002
+#define FILE_ACTION_MODIFIED 0x00000003
+#define FILE_ACTION_RENAMED_OLD_NAME 0x00000004
+#define FILE_ACTION_RENAMED_NEW_NAME 0x00000005
 
 //-- SMB2 FileSystem Info Classes (used when info_type == SMB2_0_INFO_FILESYSTEM)
 #define FileFsSizeInformation 3
@@ -390,6 +400,26 @@ typedef struct
   uint32_t output_buffer_length;
   //-- output buffer follows
 } smb2_query_directory_response_t;
+
+//-- SMB2 Change Notify Request
+typedef struct
+{
+  uint16_t structure_size;     //-- 32
+  uint16_t flags;              //-- SMB2_WATCH_TREE = 0x0001
+  uint32_t output_buffer_length;
+  uint8_t file_id[16];
+  uint32_t completion_filter;
+  uint32_t reserved;
+} smb2_change_notify_request_t;
+
+//-- SMB2 Change Notify Response
+typedef struct
+{
+  uint16_t structure_size;     //-- 9
+  uint16_t output_buffer_offset;
+  uint32_t output_buffer_length;
+  //-- buffer follows: array of FILE_NOTIFY_INFORMATION (MS-FSCC 2.7.1)
+} smb2_change_notify_response_t;
 
 //-- Packet Buffer
 typedef struct
