@@ -1,65 +1,72 @@
-# smb_server project
+<!--
+smb-server - README of the smb-server repository and root test application
+Copyright (C) 2026 Willem Aandewiel (mrWheel)
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-This version uses a local vendored `libsmb2_port` component instead of the old
-Espressif Registry `sahlberg/libsmb2` 3.0.1 package or a moving Git dependency.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
 
-## Repository structure
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
 
-```text
-components/
-├── smb_server/
-└── libsmb2_port/
-    └── vendor/
-        └── libsmb2/      <- imported upstream source
+# smb-server
 
-examples/
-└── basic/
-```
+ESP-IDF component that turns an ESP32 into a guest-accessible SMB2/SMB3 file
+server, exposing an already-mounted ESP-IDF VFS filesystem (LittleFS, FatFS,
+...) as a network share.
 
-## First-time setup
+The SMB2 protocol is implemented directly in the `smb_server` component - no
+libsmb2 or other external SMB stack is used.
 
-Obtain current upstream `sahlberg/libsmb2` source and import it once:
+## Contents
+
+- Repository root - a test application (`main/`) that builds the basic
+  example straight from the checkout, same layout as the ringFileStore
+  repository.
+- [`components/smb_server/`](components/smb_server/) - the reusable component
+  (public API, Kconfig options, installation and usage documentation in its
+  [README](components/smb_server/README.md)).
+- [`components/smb_server/examples/basic/`](components/smb_server/examples/basic/) -
+  self-contained LittleFS + WiFi + mDNS demo, buildable from a Git checkout
+  or from the published component. The root application reuses its `main.c`,
+  partition table and `sdkconfig.defaults`, so there is a single source.
+- [`protocolReferences.md`](protocolReferences.md) - protocol specification
+  notes used while implementing the handlers.
+
+## Build and flash the demo
+
+From the repository root:
 
 ```bash
-./tools/vendor_libsmb2.sh /path/to/libsmb2
-```
-
-This copies the source into the project and records the exact Git commit when
-available.
-
-After that, the build does not need a Git dependency for libsmb2.
-
-## Why the upstream source is local
-
-Upstream currently documents:
-
-- SMB2/SMB3 client/server support
-- a synchronous SMB server API
-- an `examples/smb2-server-sync.c` implementation
-- direct ESP-IDF support
-
-The upstream CMake project currently reports version 6.1.0.
-
-The old Registry package 3.0.1 is therefore not used.
-
-## Build
-
-```bash
-cd examples/basic
-idf.py set-target esp32
+idf.py set-target esp32s3
 idf.py build
+idf.py -p /dev/tty.usbserial-1430 flash monitor
 ```
 
-The basic example still uses managed Registry dependencies for the WiFi
-provisioner, mDNS and LittleFS, but `libsmb2` is entirely local.
+Then provision WiFi via the `ESP-SMB-Setup` access point and connect to the
+`ESP32` share (see the [example README](components/smb_server/examples/basic/README.md)).
 
-## Important
+## Quick start
 
-The vendor directory intentionally starts empty in this distribution. The
-upstream LGPL source must be imported with `tools/vendor_libsmb2.sh`.
+```c
+#include "smb_server.h"
 
-The script copies the **complete upstream source tree**. Do not prematurely strip
-client or protocol files merely to save space: first obtain a working SMB server
-build, measure flash/RAM usage, and only then remove proven-unused code.
+smb_server_config_t config = SMB_SERVER_DEFAULT_CONFIG();
+config.share_name = "ESP32";
+config.mount_point = "/littlefs";
+ESP_ERROR_CHECK(smb_server_start(&config));
+```
 
-See `components/libsmb2_port/VENDORING.md`.
+See the [component README](components/smb_server/README.md) for installation,
+configuration and the list of protocol limitations.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE) and
+[components/smb_server/LICENSE](components/smb_server/LICENSE).

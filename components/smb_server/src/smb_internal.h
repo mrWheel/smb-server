@@ -1,3 +1,18 @@
+//-- smb_server - internal declarations shared by the smb_server sources
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- This program is free software: you can redistribute it and/or modify
+//-- it under the terms of the GNU General Public License as published by
+//-- the Free Software Foundation, either version 3 of the License, or
+//-- (at your option) any later version.
+//--
+//-- This program is distributed in the hope that it will be useful,
+//-- but WITHOUT ANY WARRANTY; without even the implied warranty of
+//-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//-- GNU General Public License for more details.
+//--
+//-- You should have received a copy of the GNU General Public License
+//-- along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 #pragma once
 
 #include <stdbool.h>
@@ -36,6 +51,7 @@ typedef struct
   int fd;
   void *dir;
   uint64_t smb_file_id;
+  int owner_socket;          //-- connection that opened this handle; scopes release_by_socket()
   void *pipe_response;
   size_t pipe_response_length;
   size_t pipe_response_offset;
@@ -74,15 +90,18 @@ int smb_vfs_rename(const char *old_path, const char *new_path);
 
 void smb_session_reset(void);
 esp_err_t smb_session_allocate_file(
+  int owner_socket,
   const char *path,
   int fd,
   uint64_t *smb_file_id);
 esp_err_t smb_session_allocate_directory(
+  int owner_socket,
   const char *path,
   void *dir,
   uint64_t *smb_file_id);
-esp_err_t smb_session_allocate_pipe(uint64_t *smb_file_id);
+esp_err_t smb_session_allocate_pipe(int owner_socket, uint64_t *smb_file_id);
 esp_err_t smb_session_lookup(
   uint64_t smb_file_id,
   smb_session_handle_t **handle);
 esp_err_t smb_session_release(uint64_t smb_file_id);
+void smb_session_release_by_socket(int owner_socket);

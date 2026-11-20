@@ -1,3 +1,18 @@
+//-- smb_server - SMB2 packet framing, parsing and serialization
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- This program is free software: you can redistribute it and/or modify
+//-- it under the terms of the GNU General Public License as published by
+//-- the Free Software Foundation, either version 3 of the License, or
+//-- (at your option) any later version.
+//--
+//-- This program is distributed in the hope that it will be useful,
+//-- but WITHOUT ANY WARRANTY; without even the implied warranty of
+//-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//-- GNU General Public License for more details.
+//--
+//-- You should have received a copy of the GNU General Public License
+//-- along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 #include <string.h>
 #include "esp_log.h"
 #include "smb_packet.h"
@@ -98,14 +113,16 @@ int smb2_parse_header(const uint8_t *data, size_t length, smb2_header_t *header)
   header->credit_charge = smb2_get_u16_le(data + 6);
   header->status = smb2_get_u32_le(data + 8);
   header->command = smb2_get_u16_le(data + 12);
-  header->credit_requested = smb2_get_u16_le(data + 14);
-  header->flags = smb2_get_u32_le(data + 16);
-  header->next_command = smb2_get_u32_le(data + 20);
-  header->message_id = smb2_get_u64_le(data + 24);
-  header->reserved = smb2_get_u32_le(data + 32);
-  header->tree_id = smb2_get_u32_le(data + 36);
-  header->session_id = smb2_get_u64_le(data + 40);
-  memcpy(header->signature_bytes, data + 48, 16);
+  //-- Fields below sit past the 14-byte minimum; unread fields stay
+  //-- zeroed by the memset above rather than reading past `length`.
+  if (length >= 16)  header->credit_requested = smb2_get_u16_le(data + 14);
+  if (length >= 20)  header->flags = smb2_get_u32_le(data + 16);
+  if (length >= 24)  header->next_command = smb2_get_u32_le(data + 20);
+  if (length >= 32)  header->message_id = smb2_get_u64_le(data + 24);
+  if (length >= 36)  header->reserved = smb2_get_u32_le(data + 32);
+  if (length >= 40)  header->tree_id = smb2_get_u32_le(data + 36);
+  if (length >= 48)  header->session_id = smb2_get_u64_le(data + 40);
+  if (length >= 64)  memcpy(header->signature_bytes, data + 48, 16);
 
   ESP_LOGI(TAG, "Parsed: sig=0x%08x, struct_size=%u, cmd=0x%04x (%s), msg_id=%llu",
     header->signature, header->structure_size, header->command, smb2_command_name(header->command), header->message_id);

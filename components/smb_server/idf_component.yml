@@ -1,5 +1,6 @@
-version: "0.2.0"
+version: "0.3.0"
 description: "SMB2/SMB3 server component for exposing an ESP-IDF VFS mount point"
+repository: "https://github.com/mrWheel/smb-server"
 license: "GPL-3.0-or-later"
 tags:
   - smb

@@ -1,4 +1,18 @@
 {
     "idf.currentSetup": "/Users/willema/.espressif/v6.0.2/esp-idf",
-    "idf.port": "/dev/tty.usbserial-1430"
+    "idf.port": "/dev/tty.usbserial-1430",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "OPENOCD_USB_ADAPTER_LOCATION": "32-2.4",
+        "IDF_TARGET": "esp32s3"
+    },
+    "clangd.path": "/Users/willema/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=/Users/willema/Documents/espidfProjects/smb-server/build"
+    ],
+    "idf.flashType": "UART"
 }

@@ -1,3 +1,18 @@
+//-- smb_server - SMB2 command handlers (negotiate, session, tree, file operations)
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- This program is free software: you can redistribute it and/or modify
+//-- it under the terms of the GNU General Public License as published by
+//-- the Free Software Foundation, either version 3 of the License, or
+//-- (at your option) any later version.
+//--
+//-- This program is distributed in the hope that it will be useful,
+//-- but WITHOUT ANY WARRANTY; without even the implied warranty of
+//-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//-- GNU General Public License for more details.
+//--
+//-- You should have received a copy of the GNU General Public License
+//-- along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -34,6 +49,11 @@ static const char *TAG = "smb_protocol";
 //-- waiting for credits, and its reconnect attempts then fail with "Insufficient
 //-- credits after reconnect", leaving the session permanently dead.
 #define SMB_SERVER_MAX_CREDITS 32
+
+//-- Real clients never chain more than 3-4 SMB2 commands via NextCommand.
+//-- This bounds the compound-request loop against a malformed/hostile chain
+//-- of tiny NextCommand jumps that would otherwise iterate up to payload_length times.
+#define SMB_SERVER_MAX_COMPOUND_COMMANDS 16
 
 static void smb_protocol_dump_packet(const char *label, const uint8_t *data, size_t length)
 {
@@ -562,7 +582,7 @@ static int smb_protocol_handle_create(
   if (smb_protocol_is_ipc_tree(ctx, ctx->last_request_header.tree_id) && strcasecmp(smb_name, "srvsvc") == 0)
   {
     uint64_t smb_file_id = 0;
-    if (smb_session_allocate_pipe(&smb_file_id) != ESP_OK)
+    if (smb_session_allocate_pipe(ctx->socket, &smb_file_id) != ESP_OK)
     {
       return smb_protocol_build_header_response(ctx, response, response_capacity,
         STATUS_INSUFFICIENT_RESOURCES, 0, response_length);
@@ -636,7 +656,7 @@ static int smb_protocol_handle_create(
       {
         status = smb_protocol_status_from_errno(errno);
       }
-      else if (smb_session_allocate_directory(path, directory, &smb_file_id) != ESP_OK)
+      else if (smb_session_allocate_directory(ctx->socket, path, directory, &smb_file_id) != ESP_OK)
       {
         closedir(directory);
         status = STATUS_INSUFFICIENT_RESOURCES;
@@ -673,7 +693,7 @@ static int smb_protocol_handle_create(
     {
       status = smb_protocol_status_from_errno(errno);
     }
-    else if (smb_session_allocate_file(path, fd, &smb_file_id) != ESP_OK)
+    else if (smb_session_allocate_file(ctx->socket, path, fd, &smb_file_id) != ESP_OK)
     {
       smb_vfs_close(fd);
       status = STATUS_INSUFFICIENT_RESOURCES;
@@ -1772,9 +1792,6 @@ static int smb_protocol_handle_session_setup(
         "Session Setup security token",
         request + security_buffer_start,
         security_buffer_length);
-      //-- See exactly which container (bare NTLMSSP vs SPNEGO NegTokenInit)
-      //-- this client actually sent, without needing a packet capture.
-      ESP_LOG_BUFFER_HEXDUMP(TAG, request + security_buffer_start, security_buffer_length, ESP_LOG_INFO);
       client_sent_bare_ntlmssp = security_buffer_length >= 8 &&
         memcmp(request + security_buffer_start, "NTLMSSP\0", 8) == 0;
     }
@@ -1868,9 +1885,6 @@ static int smb_protocol_handle_session_setup(
   *response_length = security_token_offset + security_token_length;
   ESP_LOGI(TAG, "Session Setup response: %zu bytes, status=0x%08x, session_id=0x%llx",
     *response_length, resp_header.status, resp_header.session_id);
-  //-- Dump the exact outgoing bytes so the SPNEGO/NTLM challenge can be
-  //-- diffed byte-for-byte against the spec without needing a packet capture.
-  ESP_LOG_BUFFER_HEXDUMP(TAG, response, *response_length, ESP_LOG_INFO);
 
   return 0;
 }
@@ -1978,10 +1992,6 @@ static int smb_protocol_handle_tree_connect(
   }
 
   ESP_LOGI(TAG, "Tree Connect response: %zu bytes, status=0x%08x, tree_id=%u", *response_length, status, resp_header.tree_id);
-  //-- Dump the exact outgoing bytes so a working (IPC$) response can be
-  //-- diffed byte-for-byte against a failing (disk share) one from the log
-  //-- alone, without needing a packet capture.
-  ESP_LOG_BUFFER_HEXDUMP(TAG, response, *response_length, ESP_LOG_INFO);
 
   return 0;
 }
@@ -2055,10 +2065,22 @@ static int smb_protocol_process_request(
   uint8_t *prev_response_header = NULL;
   size_t request_offset = 0;
   size_t write_offset = 0;
+  size_t compound_command_count = 0;
   int result = 0;
 
   while (1)
   {
+    if (compound_command_count >= SMB_SERVER_MAX_COMPOUND_COMMANDS)
+    {
+      ESP_LOGW(TAG, "Compound chain truncated: exceeded max of %d sub-commands", SMB_SERVER_MAX_COMPOUND_COMMANDS);
+      if (write_offset > 0)
+      {
+        smb2_put_u32_le(prev_response_header + offsetof(smb2_header_t, next_command), 0);
+      }
+      result = 0;
+      break;
+    }
+
     if (request_offset >= payload_length ||
         smb2_parse_header(payload + request_offset, payload_length - request_offset, &ctx->last_request_header) != 0)
     {
@@ -2075,6 +2097,8 @@ static int smb_protocol_process_request(
       }
       break;
     }
+
+    compound_command_count++;
 
     bool is_last = (ctx->last_request_header.next_command == 0);
     size_t sub_request_length = is_last ? (payload_length - request_offset) : ctx->last_request_header.next_command;
@@ -2202,11 +2226,12 @@ static int smb_protocol_process_request(
         //-- LOGOFF ends the session; a later SESSION_SETUP on this same TCP
         //-- connection is a brand-new leg-1 negotiate, not a continuation.
         ctx->session_setup_started = false;
-        smb_session_reset();
         //-- Slots don't track tree_id, so TREE_DISCONNECT (which falls through
-        //-- to here) frees ALL of this connection's pending watches, not just
-        //-- ones on the disconnected tree (accepted deviation; only matters
-        //-- with two disk trees open at once).
+        //-- to here) frees ALL of this connection's open handles and pending
+        //-- watches, not just ones on the disconnected tree (accepted
+        //-- deviation; only matters with two disk trees open at once). Scoped
+        //-- to this connection's socket so other clients' handles are untouched.
+        smb_session_release_by_socket(ctx->socket);
         smb_protocol_notify_release_by_socket(ctx->socket);
         {
           smb2_header_t *resp_header = (smb2_header_t *)sub_response;
@@ -2528,7 +2553,7 @@ static void smb_protocol_client_handler(void *arg)
     buffered_len = leftover;
   }
 
-  smb_session_reset();
+  smb_session_release_by_socket(client_socket);
   smb_protocol_notify_release_by_socket(client_socket);
   free(request_buffer);
   free(response_buffer);

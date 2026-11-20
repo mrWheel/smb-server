@@ -1,0 +1,15 @@
+## Managed dependencies for the root test application.
+## The smb_server component itself lives in ../components and needs no
+## dependency entry; it is discovered as a local project component (same
+## pattern as the ringFileStore repository).
+license: "GPL-3.0-or-later"
+
+dependencies:
+  idf:
+    version: ">=6.0"
+  michmich/esp-idf-wifi-provisioner:
+    version: "^0.4.0"
+  espressif/mdns:
+    version: "^1.11.3"
+  joltwallet/littlefs:
+    version: "^1.22.3"
