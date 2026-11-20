@@ -18,11 +18,10 @@ The root app is for local development in VS Code.
 - Complete the implementation and run the tests in the project prompt.
 - Choose a license you can grant for the source, put its text in
   `components/smb_server/LICENSE` and set the matching SPDX identifier in
-  `idf_component.yml`. Use `GPL-3.0-or-later`.
+  `idf_component.yml` (`GPL-3.0-or-later`).
 - Set the first release version in the manifest, update the README with actual
   usage and tested support, and add the repository URL when it exists.
-- Use the namespace assigned to your publishing account. The examples below
-  use `your_namespace` as a placeholder.
+- Use the namespace assigned to your publishing account.
 - To ship a standalone example through the Registry, add it under
   `components/smb_server/examples/` with its own project CMake file and
   a main-component manifest referencing the actual published component.

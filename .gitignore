@@ -6,3 +6,4 @@ sdkconfig.old
 dist/
 .DS_Store
 .clangd
+log.*

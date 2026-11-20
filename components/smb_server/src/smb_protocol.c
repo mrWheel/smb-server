@@ -55,6 +55,15 @@ static const char *TAG = "smb_protocol";
 //-- of tiny NextCommand jumps that would otherwise iterate up to payload_length times.
 #define SMB_SERVER_MAX_COMPOUND_COMMANDS 16
 
+//-- IO sizes advertised in the Negotiate response (max_transact/read/write).
+//-- Clients honour these values and send WRITE requests of up to max_write_size
+//-- payload bytes in a single NetBIOS frame, so the client receive path must be
+//-- able to buffer one full-size frame: NetBIOS header (4) + SMB2 header (64) +
+//-- fixed request body + payload, plus headroom for chained (compound)
+//-- sub-commands around the big one.
+#define SMB_SERVER_MAX_IO_SIZE 65536
+#define SMB_SERVER_MAX_REQUEST_FRAME (SMB_SERVER_MAX_IO_SIZE + 1024)
+
 static void smb_protocol_dump_packet(const char *label, const uint8_t *data, size_t length)
 {
   //-- Verbose per-packet hex dump; kept at DEBUG level so it does not flood
@@ -1673,9 +1682,9 @@ static int smb_protocol_handle_negotiate(
       0x32, 0x2d, 0x53, 0x45, 0x52, 0x56, 0x52, 0x01 };
   memcpy(resp_body + 8, server_guid, sizeof(server_guid));
   smb2_put_u32_le(resp_body + 24, 0);  //-- capabilities
-  smb2_put_u32_le(resp_body + 28, 65536);  //-- max_transact_size
-  smb2_put_u32_le(resp_body + 32, 65536);  //-- max_read_size
-  smb2_put_u32_le(resp_body + 36, 65536);  //-- max_write_size
+  smb2_put_u32_le(resp_body + 28, SMB_SERVER_MAX_IO_SIZE);  //-- max_transact_size
+  smb2_put_u32_le(resp_body + 32, SMB_SERVER_MAX_IO_SIZE);  //-- max_read_size
+  smb2_put_u32_le(resp_body + 36, SMB_SERVER_MAX_IO_SIZE);  //-- max_write_size
   uint64_t server_time = smb_protocol_filetime(time(NULL));
   smb2_put_u64_le(resp_body + 40, server_time);  //-- system_time
   smb2_put_u64_le(resp_body + 48, server_time);  //-- server_start_time
@@ -2164,6 +2173,20 @@ static int smb_protocol_process_request(
         }
         break;
 
+      case SMB2_LOCK:
+        //-- MS-SMB2 2.2.29 byte-range lock requests (clients issue "unlock-all
+        //-- then lock" pairs when apps open files with fcntl-style locking;
+        //-- an unlock is simply a lock request carrying the unlock flag).
+        //-- Always grant with a header-only STATUS_SUCCESS response
+        //-- (MS-SMB2 2.2.30 defines no body): this minimal guest server never
+        //-- enforced locks anyway, and the Samba-style grant-everything
+        //-- behaviour is far better tolerated by strict SMB2 clients than the
+        //-- STATUS_NOT_SUPPORTED the default case would return.
+        ESP_LOGI(TAG, "Command 0x%02x: LOCK (always granted)", ctx->last_request_header.command);
+        result = smb_protocol_build_header_response(ctx, sub_response, sub_response_capacity,
+          STATUS_SUCCESS, 0, &sub_response_length);
+        break;
+
       case SMB2_READ:
         result = smb_protocol_handle_read(ctx, cmd_payload, cmd_payload_length, sub_response, sub_response_capacity, &sub_response_length);
         break;
@@ -2407,6 +2430,23 @@ static void smb_protocol_notify_poll(smb_protocol_context_t *ctx, uint8_t *respo
   }
 }
 
+//-- One-line hex dump of the first 16 bytes of a pending frame (missing
+//-- bytes show as 00). WARN level on purpose: it fires only from the
+//-- framing-desync diagnostic paths below, and is the evidence needed to
+//-- tell whether an announced NetBIOS length disagrees with the real bytes.
+static void smb_protocol_log_frame_prefix(const uint8_t *data, size_t length)
+{
+  ESP_LOGW(TAG, "  frame bytes: %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x",
+    (length > 0) ? data[0] : 0, (length > 1) ? data[1] : 0,
+    (length > 2) ? data[2] : 0, (length > 3) ? data[3] : 0,
+    (length > 4) ? data[4] : 0, (length > 5) ? data[5] : 0,
+    (length > 6) ? data[6] : 0, (length > 7) ? data[7] : 0,
+    (length > 8) ? data[8] : 0, (length > 9) ? data[9] : 0,
+    (length > 10) ? data[10] : 0, (length > 11) ? data[11] : 0,
+    (length > 12) ? data[12] : 0, (length > 13) ? data[13] : 0,
+    (length > 14) ? data[14] : 0, (length > 15) ? data[15] : 0);
+}
+
 static void smb_protocol_client_handler(void *arg)
 {
   int client_socket = (intptr_t)arg;
@@ -2430,6 +2470,11 @@ static void smb_protocol_client_handler(void *arg)
     return;
   }
 
+  //-- Current allocation of request_buffer; grown on demand (see below) to
+  //-- hold frames larger than BUFFER_SIZE, e.g. a 64KB WRITE as advertised
+  //-- in the Negotiate response.
+  size_t request_capacity = BUFFER_SIZE;
+
   //-- Poll tick for pending CHANGE_NOTIFY watches: without this, a client
   //-- with an outstanding watch and nothing else to say would leave recv()
   //-- blocked forever, and a fired watch's final response would never be
@@ -2446,18 +2491,75 @@ static void smb_protocol_client_handler(void *arg)
   //-- discarded (see the "Incomplete trailing NetBIOS frame" case below).
   size_t buffered_len = 0;
 
+  //-- Tick of the last recv() that delivered bytes; used only to spot an
+  //-- incomplete frame that stopped making progress (peer sent fewer bytes
+  //-- than it announced) and dump it once instead of stalling silently.
+  uint32_t last_progress_tick = xTaskGetTickCount();
+
   while (1)
   {
-    if (buffered_len == BUFFER_SIZE)
+    //-- Grow the request buffer to the size the client announced in the
+    //-- NetBIOS header of the pending frame (readable once at least those
+    //-- 4 bytes are buffered; the frame loop below always leaves any
+    //-- incomplete trailing frame at the front, so bytes [0..3] here are
+    //-- that frame's header). A client honouring our advertised
+    //-- max_write_size sends WRITE requests far larger than BUFFER_SIZE;
+    //-- without growing, recv() fills the buffer with a never-completing
+    //-- frame and the guard below kills a healthy connection mid file-copy.
+    if (buffered_len >= 4)
     {
-      ESP_LOGE(TAG, "NetBIOS frame exceeds buffer size (%d bytes); disconnecting", BUFFER_SIZE);
+      uint32_t announced = ((uint32_t)request_buffer[1] << 16) |
+        ((uint32_t)request_buffer[2] << 8) | (uint32_t)request_buffer[3];
+      size_t frame_capacity = 4 + (size_t)announced;
+      if (frame_capacity > request_capacity)
+      {
+        if (frame_capacity > SMB_SERVER_MAX_REQUEST_FRAME)
+        {
+          //-- Almost always a framing desync: an earlier frame announced
+          //-- fewer bytes than it actually carried, so bytes [0..3] here are
+          //-- file data (e.g. 0xFF runs in image bytes), not a NetBIOS
+          //-- header. Dump the raw context as evidence.
+          ESP_LOGW(TAG, "Oversized frame at buffer front: announced=%lu buffered=%zu capacity=%zu",
+            (unsigned long)announced, buffered_len, request_capacity);
+          smb_protocol_log_frame_prefix(request_buffer, buffered_len);
+          ESP_LOGE(TAG, "NetBIOS frame %zu bytes exceeds max request size (limit %d bytes); disconnecting",
+            frame_capacity, SMB_SERVER_MAX_REQUEST_FRAME);
+          break;
+        }
+        uint8_t *grown = realloc(request_buffer, frame_capacity);
+        if (grown == NULL)
+        {
+          ESP_LOGE(TAG, "Failed to grow request buffer to %zu bytes; disconnecting", frame_capacity);
+          break;
+        }
+        request_buffer = grown;
+        request_capacity = frame_capacity;
+        ESP_LOGI(TAG, "Request buffer grown to %zu bytes for announced NetBIOS frame", request_capacity);
+      }
+    }
+
+    if (buffered_len == request_capacity)
+    {
+      ESP_LOGE(TAG, "NetBIOS frame exceeds request buffer size (%zu bytes); disconnecting", request_capacity);
       break;
     }
 
-    ssize_t bytes_read = recv(client_socket, request_buffer + buffered_len, BUFFER_SIZE - buffered_len, 0);
+    ssize_t bytes_read = recv(client_socket, request_buffer + buffered_len, request_capacity - buffered_len, 0);
     if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
     {
       smb_protocol_notify_poll(&ctx, response_buffer, BUFFER_SIZE);
+      //-- A pending partial frame that stops receiving bytes is a peer that
+      //-- sent fewer bytes than it announced; dump it once per 3 s instead
+      //-- of stalling on it silently until the socket times out elsewhere.
+      if (buffered_len > 0 && (xTaskGetTickCount() - last_progress_tick) >= pdMS_TO_TICKS(3000))
+      {
+        uint32_t pending_announced = (buffered_len >= 4) ?
+          (((uint32_t)request_buffer[1] << 16) | ((uint32_t)request_buffer[2] << 8) | (uint32_t)request_buffer[3]) : 0;
+        ESP_LOGW(TAG, "Stalled partial frame: buffered %zu of announced %lu bytes",
+          buffered_len, (unsigned long)pending_announced);
+        smb_protocol_log_frame_prefix(request_buffer, buffered_len);
+        last_progress_tick = xTaskGetTickCount();
+      }
       continue;
     }
     if (bytes_read <= 0)
@@ -2470,6 +2572,7 @@ static void smb_protocol_client_handler(void *arg)
     smb_protocol_dump_packet("Request", request_buffer + buffered_len, (size_t)bytes_read);
 
     buffered_len += (size_t)bytes_read;
+    last_progress_tick = xTaskGetTickCount();
 
     //-- A single recv() may coalesce multiple NetBIOS-framed SMB2 messages
     //-- (e.g. Finder pipelining CREATE+CLOSE immediately followed by
@@ -2485,6 +2588,17 @@ static void smb_protocol_client_handler(void *arg)
       const uint8_t *frame = request_buffer + frame_offset;
       uint32_t netbios_length = ((uint32_t)frame[1] << 16) | ((uint32_t)frame[2] << 8) | frame[3];
       size_t frame_total = 4 + netbios_length;
+
+      //-- An SMB2-over-TCP session message always carries NetBIOS type 0x00;
+      //-- any other value means the framing is off a message boundary (see
+      //-- the announced-length desync above). Diagnostic only - the frame is
+      //-- still handed to the normal parse path which will reject it.
+      if (frame[0] != 0x00)
+      {
+        ESP_LOGW(TAG, "NetBIOS frame at offset %zu has unexpected type 0x%02x (framing desync?)",
+          frame_offset, frame[0]);
+        smb_protocol_log_frame_prefix(frame, buffered_len - frame_offset);
+      }
 
       if (frame_offset + frame_total > buffered_len)
       {

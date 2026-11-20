@@ -27,6 +27,15 @@
 
 static const char *TAG = "smb_example";
 
+//-- Silence the two protocol log tags. Function calls are not allowed at
+//-- file scope in C, so they run from an init constructor that the C
+//-- runtime executes before app_main().
+__attribute__((constructor)) static void example_quiet_smb_logs(void)
+{
+  esp_log_level_set("smb_protocol", ESP_LOG_WARN);
+  esp_log_level_set("smb_packet", ESP_LOG_WARN);
+}
+
 #define EXAMPLE_HOSTNAME "esp-smb"
 #define EXAMPLE_SHARE_NAME "ESP32"
 #define EXAMPLE_MOUNT_POINT "/littlefs"

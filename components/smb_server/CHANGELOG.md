@@ -17,6 +17,32 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Changelog
 
+fileVersion: [2] - 20-11-2026 - 11:18
+
+## Unreleased
+
+- Always-grant `SMB2_LOCK` (0x0a): byte-range lock requests are answered
+  with a header-only `STATUS_SUCCESS` (Samba `locking = off` style)
+  instead of `STATUS_NOT_SUPPORTED`, which stricter SMB2 clients treat
+  as fatal.
+- Added framing-desync diagnostics to the client receive loop: hex dump
+  of the buffer front on an oversized announced NetBIOS frame, a WARN
+  when a frame carries a non-`0x00` NetBIOS type byte, and a
+  once-per-3 s WARN when a partial frame stops making progress. (Open
+  issue: a mid-WRITE-stream desync was observed where the announced
+  frame length disagrees with the bytes actually sent.)
+
+- Fixed a forced disconnect during file uploads: the Negotiate response
+  advertises `max_write_size` of 64 KB, and a client honouring it sends
+  WRITE requests in a single NetBIOS frame far larger than the client
+  handler's fixed 8 KB receive buffer; the receive loop now reads the
+  announced NetBIOS frame length and grows the request buffer on demand
+  (capped at the advertised IO size plus headroom) instead of
+  disconnecting with `NetBIOS frame exceeds buffer size`.
+- Moved the example app's `esp_log_level_set("smb_protocol", ...)` call
+  from file scope (not valid C; broke the build) into `app_main()` right
+  before `smb_server_start()`.
+
 ## 0.3.0
 
 - Added the standard GPL-3.0 copyright/license header to every `.c`, `.h`

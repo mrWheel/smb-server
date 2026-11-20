@@ -14,6 +14,8 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
+fileVersion: [3] - 20-11-2026 - 11:43
+
 # SMB Server — ESP32 Custom Implementation
 
 # Project Prompt — `smb_server`
@@ -23,10 +25,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 Build a **minimal, production-quality SMB2/SMB3 server component** for ESP32 that exposes an already-mounted ESP-IDF VFS filesystem as an SMB2/SMB3 network share.
 
 The component must work reliably with:
-- macOS Finder and `smbutil`
+- macOS Finder, `smbutil` and `mount_smbfs`
 - Windows File Explorer
 - Linux `mount -t cifs`
-- iOS/iPadOS SMB clients (FileBrowser, etc.)
+- iOS/iPadOS SMB clients (FileBrowser, Files, "Filer")
 
 The final result must be structured and reusable so that the `smb_server` component can be published in the Espressif Component Registry.
 
@@ -41,121 +43,220 @@ The final result must be structured and reusable so that the `smb_server` compon
 
 **Solution:** Implement a minimal, focused SMB2 protocol handler directly in the `smb_server` component.
 
-**References:** Don't guess but check "/protocolReferences.md".
+**References:** Don't guess but check "/protocolReferences.md". It contains the
+authoritative MS-SRVS / MS-RPCE references, the Samba srvsvc IDL pointers, and the
+hardware-observed wire facts (SMB1 preamble bridge, raw NTLMSSP flow, BIND/BIND_ACK
+sizes, `FSCTL_PIPE_TRANSCEIVE` code, `opnum 0x000f`). Never change NetrShareEnum
+byte layouts from memory: derive them from MS-SRVS plus Samba's `srvsvc.idl`, then
+validate the exact bytes on hardware.
+
+## Repository Layout
+
+```
+smb-server/
+├── CMakeLists.txt            # root demo app: project(smb_server_basic)
+├── main/                     # root entry point, #includes the example main.c
+│   ├── main.c
+│   └── idf_component.yml     # demo deps: wifi-provisioner, mdns, littlefs
+├── partitions.csv            # symlink → examples/basic/partitions.csv
+├── sdkconfig.defaults        # symlink → examples/basic/sdkconfig.defaults
+├── protocolReferences.md     # normative protocol references + wire facts
+├── README.md / PUBLISHING.md / CHANGELOG.md
+└── components/smb_server/
+    ├── CMakeLists.txt        # idf_component_register (see Build wiring)
+    ├── Kconfig               # SMB_SERVER_* options (see Configuration)
+    ├── idf_component.yml     # version 0.3.0, GPL-3.0-or-later, idf >=6.0
+    ├── LICENSE / README.md / CHANGELOG.md
+    ├── include/
+    │   ├── smb_server.h      # public API only
+    │   └── smb_packet.h      # wire structs, constants, codec API
+    ├── src/
+    │   ├── smb_internal.h    # shared internal types (handle table, VFS/path API)
+    │   ├── smb_server.c      # lifecycle, config validation, server task
+    │   ├── smb_protocol.c    # listener, per-client task, all command handlers
+    │   ├── smb_packet.c      # little-endian codec, header parse/build
+    │   ├── smb_path.c        # UTF-16LE→UTF-8, path resolve/containment
+    │   ├── smb_vfs.c         # thin POSIX/VFS wrapper (open/pread/pwrite/stat/…)
+    │   └── smb_session.c     # global file/dir/pipe handle table
+    └── examples/basic/       # self-contained demo (WiFi prov, mDNS, LittleFS)
+```
+
+The root build and the component example share one `main.c` (the root `main/`
+includes the example file); `littlefs_assets/` is baked into the `littlefs`
+partition at build time. The component itself stays publishable and independent.
+
+## Public API (`include/smb_server.h`)
+
+```c
+typedef struct
+{
+  const char *share_name;    // 1..31 characters, e.g. "ESP32"
+  const char *mount_point;   // absolute VFS path, e.g. "/littlefs"
+  bool read_only;
+  size_t max_clients;        // 1..4
+  uint16_t port;             // 445 by default
+} smb_server_config_t;
+
+#define SMB_SERVER_DEFAULT_CONFIG() { /* from Kconfig; mount_point = NULL */ }
+
+esp_err_t smb_server_start(const smb_server_config_t *config);
+esp_err_t smb_server_stop(void);
+bool smb_server_is_running(void);
+esp_err_t smb_server_get_config(smb_server_config_t *config);
+```
+
+`smb_server_start()` validates: non-NULL config; non-empty `share_name` < 32
+chars; absolute `mount_point` < 128 chars that `stat()` resolves to a directory;
+`max_clients` 1..4; `port` != 0; returns `ESP_ERR_INVALID_STATE` when already
+running, `ESP_ERR_NO_MEM` when the task cannot be created. It copies the config
+into a global state struct and creates the server task
+(`CONFIG_SMB_SERVER_TASK_STACK_SIZE` / `CONFIG_SMB_SERVER_TASK_PRIORITY`).
+`smb_server_stop()` sets the stop flag, closes the listen socket and lets the
+loop exit (graceful; client tasks end when their sockets close).
+
+## Configuration (Kconfig)
+
+| Option | Default | Purpose |
+|---|---|---|
+| `SMB_SERVER_DEFAULT_SHARE_NAME` | `ESP32` | Share name for `SMB_SERVER_DEFAULT_CONFIG()` |
+| `SMB_SERVER_MAX_CLIENTS` | 1 (range 1-4) | Advertised simultaneous clients |
+| `SMB_SERVER_TASK_STACK_SIZE` | 12288 | Server/listener task stack |
+| `SMB_SERVER_TASK_PRIORITY` | 5 | Server task priority |
+| `SMB_SERVER_PORT` | 445 | TCP listen port |
+| `SMB_SERVER_VERBOSE_LOGGING` | n | Verbose protocol logging |
+
+## Build wiring (`components/smb_server/CMakeLists.txt`)
+
+```cmake
+idf_component_register(
+  SRCS src/smb_server.c src/smb_protocol.c src/smb_packet.c
+       src/smb_path.c src/smb_vfs.c src/smb_session.c
+  INCLUDE_DIRS "include"
+  PRIV_INCLUDE_DIRS "src"
+  REQUIRES esp_common
+  PRIV_REQUIRES freertos log heap lwip vfs
+)
+```
+
+Compile warnings: `-Wall -Wextra -Werror=return-type`. Public header depends only
+on `esp_err.h`/std C headers so the public surface stays minimal.
+`idf_component.yml`: version `0.3.0`, license `GPL-3.0-or-later`, targets
+`esp32`, `esp32s2`, `esp32s3`, `esp32c3`, `idf >= 6.0`.
 
 ## Scope: Minimal SMB2 Server
 
-Implement ONLY these operations (alphabetically):
+### Core SMB2 Commands (command code = SMB2 header `Command` field)
 
-### Core SMB2 Commands
+1. **NEGOTIATE (0x00)** — dialect selection (SMB 2.0.2, 2.1, 3.0, 3.0.2; no 3.1.1)
+2. **SESSION_SETUP (0x01)** — guest-only, two-leg NTLMSSP handshake (no crypto)
+3. **LOGOFF (0x02)** — header-only success; frees this connection's handles/watches
+4. **TREE_CONNECT (0x03)** — disk share or `IPC$` (srvsvc pipe)
+5. **TREE_DISCONNECT (0x04)** — frees tree slot + this connection's handles/watches
+6. **CREATE (0x05)** — open/create files, directories, `srvsvc` pipes; MxAc context
+7. **CLOSE (0x06)** — close handle, honour delete-pending
+8. **FLUSH (0x07)** — header-only `STATUS_SUCCESS`
+9. **READ (0x08)** — file data via `pread`-style offset read
+10. **WRITE (0x09)** — file data via `pwrite`-style offset write
+11. **LOCK (0x0a)** — always granted, header-only `STATUS_SUCCESS` (no enforcement)
+12. **IOCTL (0x0b)** — `FSCTL_PIPE_TRANSCEIVE` (DCE/RPC); others well-formed NOT_SUPPORTED
+13. **CANCEL (0x0c)** — async cancel of a pending CHANGE_NOTIFY; no response, ever
+14. **ECHO (0x0d)** — 4-byte body success
+15. **QUERY_DIRECTORY (0x0e)** — `FileIdBothDirectoryInformation` listing
+16. **CHANGE_NOTIFY (0x0f)** — async directory watch (interim `STATUS_PENDING`)
+17. **QUERY_INFO (0x10)** — file info classes + `FileFsSizeInformation`
+18. **SET_INFO (0x11)** — disposition (delete-on-close), EOF (truncate), basic (no-op)
 
-1. **Negotiate** — Dialect selection (SMB 2.1, 3.0, 3.1.1)
-2. **Session Setup** — Guest-only authentication (no NTLMSSP encryption)
-3. **Tree Connect** — Connect to disk shares or `IPC$` (srvsvc pipe)
-4. **Tree Disconnect** — Disconnect from share
-5. **Create** — Open/create files, directories, or pipes
-6. **Close** — Close file handles
-7. **Read** — Read file data or pipe data
-8. **Write** — Write file data or send pipe data (DCE/RPC requests)
-9. **Query Info** — Get file metadata (size, timestamps, attributes)
-10. **Set Info** — Modify file metadata
-11. **Query Directory** — List directory contents
-12. **Flush** — Flush file buffers
-13. **Logoff** — End SMB session
+Any other command must be answered with a well-formed
+`STATUS_NOT_SUPPORTED` response — never a silent drop (a dropped command kills
+Finder sessions with "Server connection interrupted").
 
-### Named-Pipe / DCE/RPC Operations (via `IPC$` tree)
+### Named-Pipe / DCE/RPC Operations (via `IPC$` tree, `FSCTL_PIPE_TRANSCEIVE` = `0x0011c017`)
 
-14. **DCE/RPC BIND** — Initiate RPC context (srvsvc interface)
-15. **DCE/RPC REQUEST/RESPONSE** — RPC method invocation
-16. **NetrShareEnum** — Enumerate available shares (operation 15)
+19. **DCE/RPC BIND** — accept with the fixed 56-byte NDR32 BIND_ACK template
+20. **DCE/RPC REQUEST/RESPONSE** — opnum dispatch
+21. **NetrShareEnum (opnum 0x000f)** — enumerate the single configured share (NDR32)
 
-### Explicitly Out of Scope (initial release)
+### Explicitly Out of Scope
 
-- Signing/encryption (guest access only)
-- Authentication beyond guest username
-- Opportunistic locks (oplocks)
-- Durable handles
-- Multi-channel, multichannel resilient support
-- SMB 1 (CIFS)
+- Request/response signing and encryption (the Negotiate response advertises
+  `security_mode=1` signing-enabled, but nothing is ever signed or verified)
+- Authentication beyond guest (any SESSION_SETUP is accepted; no NTLM crypto check)
+- Opportunistic locks / leases
+- Durable or resilient handles
+- Multi-channel
+- SMB 1 operations — with one exception: the SMB1-framed *negotiate preamble* is
+  accepted as a bridge into SMB2 (see Negotiate section)
+- SMB 3.1.1 and Negotiate Contexts (never offered)
+- DFS, ACLs, security descriptors, symbolic links, change journals
 
 ## Implementation Strategy
 
-### Phase 1: Protocol Foundation (Week 1)
+### Phase 1: Protocol Foundation
 
-**Deliverable:** SMB2 packet parser and session state machine.
+**Deliverable:** SMB2 packet parser, NetBIOS framing, response helper, session state machine.
 
-- Implement SMB2 packet header parsing (fixed 64-byte header)
-- Implement variable-length message handling (Negotiate, SessionSetup, TreeConnect payloads)
-- Session handle management (track context per client)
-- Tree handle management (track mounted shares per session)
-- File handle management (track open files per tree)
+- SMB2 wire structs `#pragma pack(1)`; explicit little-endian get/put codec
+- Header parse (minimum 14 bytes, every field past offset 14 gated on length)
+  and header build; signature check `fe 53 4d 42`
+- NetBIOS-over-TCP framing on receive and send (partial frames, coalescing,
+  dynamic growth) — see Critical Wire Requirements
+- One client-handler FreeRTOS task per connection; heap request/response buffers
+- Shared response-header helper: echoes request ids, grants credits, always
+  appends the 8-byte SMB2 Error Response tail on non-success
+- Per-connection context: `socket`, `session_setup_started`, per-connection tree
+  table (`tree_id`/`in_use`/`is_ipc` + monotonic `next_tree_id`), last request header
+- ECHO, LOGOFF, TREE_DISCONNECT, unsupported-command fallback
+- Compound-request loop (NextCommand chain, related-FileId substitution)
 
-**Estimated lines of code:** 400–600
+### Phase 2: Core Disk Share Access
 
----
+**Deliverable:** file I/O over the mounted share.
 
-### Phase 2: Core Disk Share Access (Week 1–2)
+- CREATE (UTF-16LE path decode → containment check → open/create, delete-on-close
+  flag, MxAc create-context), CLOSE (release-then-delete ordering), READ, WRITE
+- QUERY_INFO: `FileBasicInformation`, `FileStandardInformation`,
+  `FileNetworkOpenInformation`, `FileAllInformation`,
+  `FileFsSizeInformation` (static placeholder volume size)
+- SET_INFO: `FileDispositionInformation`, `FileEndOfFileInformation`,
+  `FileBasicInformation` (acknowledge only)
+- FLUSH (header-only success), LOCK (always grant)
+- Path security: `..` traversal, drive letters, separators rejected; stay inside mount point
+- `errno` → NTSTATUS mapping (table below)
 
-**Deliverable:** READ/WRITE/QUERYINFO operations on files.
-
-- Implement CREATE handler (resolve VFS path, open file with O_RDONLY/O_RDWR/O_CREAT)
-- Implement CLOSE handler (close file descriptor, release handle)
-- Implement READ handler (pread from file descriptor, return data)
-- Implement WRITE handler (pwrite to file descriptor)
-- Implement QUERY_INFO handler (stat() file, return size/timestamps/attributes)
-- Implement SET_INFO handler (chmod/touch file metadata)
-- Path security: Prevent `../` traversal; stay within configured mount point
-
-**Estimated lines of code:** 400–600
-
----
-
-### Phase 3: Directory Enumeration (Week 2)
+### Phase 3: Directory Enumeration
 
 **Deliverable:** QUERY_DIRECTORY handler for Finder listing.
 
-- Implement QUERY_DIRECTORY handler (readdir() directory contents)
-- Encode directory entries in SMB2 FILE_ID_BOTH_DIRECTORY_INFORMATION format
-- Handle pagination (client may request entries in chunks)
+- `FILE_ID_BOTH_DIR_INFORMATION` (class 37) encoder with `readdir()`
+- `SL_RESTART_SCAN` / `SL_RETURN_SINGLE_ENTRY` flags, search-pattern filtering,
+  `NextEntryOffset` chaining, 8-byte alignment, `STATUS_NO_MORE_FILES`
 
-**Estimated lines of code:** 200–300
+### Phase 4: IPC$ Share and srvsvc
 
----
+**Deliverable:** share enumeration via named pipe.
 
-### Phase 4: IPC$ Share and srvsvc (Week 2–3)
+- `IPC$` tree recognised (case-insensitive `IPC$` in the path); disk-tree path
+  must contain the configured share name
+- CREATE of `srvsvc` on an IPC tree → pipe handle (never a VFS path)
+- IOCTL `FSCTL_PIPE_TRANSCEIVE`; DCE/RPC BIND → BIND_ACK; REQUEST opnum
+  0x000f → NetrShareEnum NDR response (exact layouts below)
 
-**Deliverable:** Share enumeration via named pipe.
+### Phase 5: Async, Robustness & Client Integration
 
-- Implement CREATE for named pipes (allocate pipe context on `IPC$` tree)
-- Implement WRITE/READ for pipe I/O (queue request data, queue response data)
-- Implement DCE/RPC framing:
-  - BIND request parsing (validate NDR32 syntax)
-  - BIND_ACK generation (56 bytes, NDR32 acceptance)
-  - REQUEST parsing (extract operation number, call ID)
-  - RESPONSE generation (format output into NDR encoding)
-- Implement NetrShareEnum handler:
-  - Input: server name (ignored), level (0, 1, or 2)
-  - Output: share name, share type, share remark (UTF-16LE encoded)
-  - Encode in SHARE_INFO structure with NDR referent pointers
+**Deliverable:** verified on hardware across clients; async + hardening features.
 
-**Estimated lines of code:** 400–600
-
----
-
-### Phase 5: Client Integration & Testing (Week 3–4)
-
-**Deliverable:** Verified working on macOS, Windows, Linux.
-
-- macOS: `smbutil view -G '//guest@<IP>'` completes and lists shares
-- macOS: Finder mounts share and allows file operations
-- Windows: `net view \\<IP>` lists shares
-- Windows: Explorer mounts share and allows file operations
-- Linux: `mount -t cifs //<IP>/share /mnt/esp32 -o guest` works
-- iOS: FileBrowser app can see and access share
-
-**Estimated lines of code:** 100–200 (test harness + debug logs)
-
----
+- CHANGE_NOTIFY: watch table, interim `STATUS_PENDING`, fire hooks on
+  CREATE(ADDED)/CLOSE(REMOVED), `SO_RCVTIMEO`-driven poll + final async response,
+  CANCEL, cleanup by file-id/socket. (Deliberate scope addition beyond the
+  original out-of-scope list, requested when "Filer" busy-polled QUERY_DIRECTORY
+  because the command returned NOT_SUPPORTED.)
+- Two-leg SESSION_SETUP with NTLMSSP/SPNEGO envelope mirroring; LOGOFF resets the
+  session-leg state
+- Per-socket handle/watch release (`release_by_socket`) — one client's LOGOFF/TREE_DISCONNECT
+  must never close another client's handles; global reset only once at server start
+- Robustness caps: compound-chain cap, max request frame cap, stalled-frame diagnostics
+- Trim debug-only hex dumps back to `ESP_LOGD` once features are validated
+- Cross-client hardware validation (see Validation Criteria)
 
 ## Implementation Constraints
 
@@ -167,7 +268,9 @@ Support these filesystems only:
 
 Do NOT implement SPIFFS support.
 
-The SMB layer operates against an ESP-IDF VFS mount point and is filesystem-agnostic.
+The SMB layer operates against an ESP-IDF VFS mount point and is
+filesystem-agnostic (all I/O goes through the thin POSIX wrapper `smb_vfs.c`).
+Validated on LittleFS; the wrapper keeps other VFS filesystems viable.
 
 Typical mount points:
 ```
@@ -178,32 +281,13 @@ Typical mount points:
 ### Component Independence
 
 The `smb_server` component must NOT:
-- Configure WiFi
-- Perform WiFi provisioning
+- Configure WiFi or perform WiFi provisioning
 - Mount LittleFS or FatFS
 - Initialize SD card
 - Initialize mDNS
 
-These responsibilities belong to the example application. The reusable component remains independent from networking and filesystem initialization.
-
-### Public API
-
-Keep the public API small and predictable:
-
-```c
-typedef struct
-{
-  const char *share_name;
-  const char *mount_point;
-  bool read_only;
-  size_t max_clients;
-  uint16_t port;
-} smb_server_config_t;
-
-esp_err_t smb_server_start(const smb_server_config_t *config);
-esp_err_t smb_server_stop(void);
-bool smb_server_is_running(void);
-```
+These responsibilities belong to the example application. The reusable component
+remains independent from networking and filesystem initialization.
 
 ### Memory and Storage
 
@@ -217,67 +301,419 @@ bool smb_server_is_running(void);
 - Per-session runtime: 2–4 KB (handles, path buffers)
 - Per-file runtime: 1–2 KB (file descriptors, seek positions)
 
-**Feasibility:** Yes. Custom SMB2 implementation (2000–3000 lines) + packet buffers + session state requires ~80 KB total. Ample margin on ESP32.
+**Hard rule:** never put 8 KB packet buffers on a task stack (a 6 KB stack with
+two 8 KB stack buffers caused guaranteed `Guru Meditation` overflows in
+`lwip_recvfrom`). All packet buffers are heap-allocated per connection.
 
-## Networking and Socket Handling
+**Fixed-size internal limits (`smb_internal.h` / `smb_protocol.c`):**
 
-- Use ESP-IDF lwIP sockets directly
-- SMB2 listens on TCP port 445 (standard)
-- Support up to `max_clients` simultaneous connections
-- Non-blocking or select-based multiplexing (ESP-IDF FreeRTOS-friendly)
-- Graceful client disconnect handling
+| Constant | Value | Meaning |
+|---|---|---|
+| `SMB_SERVER_SHARE_NAME_MAX` | 32 | share name buffer |
+| `SMB_SERVER_MOUNT_POINT_MAX` | 128 | mount point buffer |
+| `SMB_SERVER_PATH_MAX` | 512 | resolved VFS paths |
+| `SMB_SERVER_HANDLE_COUNT` | 24 | global file/dir/pipe handle slots |
+| `SMB_SERVER_MAX_TREES` | 4 | open trees per connection |
+| `SMB_SERVER_MAX_NOTIFY_WATCHES` | 8 | pending CHANGE_NOTIFY watches |
+| `SMB_SERVER_NOTIFY_NAME_MAX` | 64 | notify filename buffer |
+| `SMB_SERVER_MAX_CREDITS` | 32 | credit grant cap |
+| `SMB_SERVER_MAX_COMPOUND_COMMANDS` | 16 | compound chain cap |
+| `SMB_SERVER_MAX_IO_SIZE` | 65536 | advertised transact/read/write size |
+| `SMB_SERVER_MAX_REQUEST_FRAME` | `MAX_IO_SIZE + 1024` | receive frame cap |
 
-## Protocol Details
+## Networking and Socket Handling (as implemented)
 
-### SMB2 Packet Structure
+- lwIP POSIX sockets; `SO_REUSEADDR` on the listen socket, backlog 4
+- Listen socket is bound to `INADDR_ANY:445`. Note: the current code hard-codes
+  445 in `smb_protocol_listener_task()` and ignores `config.port`; when
+  rebuilding, honour `config.port` (default 445 via Kconfig) or replicate the
+  hard-coded bind exactly
+- One `smb_client` handler task per accepted socket (6144-byte stack, priority 5);
+  the handler deletes itself on disconnect
+- `SO_RCVTIMEO` = 1 s on the client socket: the recv timeout tick is what drives
+  pending CHANGE_NOTIFY delivery
+- `max_clients` (1..4) is validated at `smb_server_start()` but the accept loop
+  does not count or cap concurrent handlers; a rebuild should enforce the cap
+  around task creation
+- Receive loop must: (1) grow `request_buffer` via `realloc()` to exactly
+  `4 + announcedNetBIOSLength` (announced from bytes 1..3 of the pending frame at
+  the buffer front) capped at `SMB_SERVER_MAX_REQUEST_FRAME`; (2) treat an
+  announcement above the cap as a protocol violation and disconnect; (3) keep any
+  incomplete trailing frame at the buffer front across `recv()` calls
+  (`memmove` the leftover; never discard a partial frame); (4) process *all*
+  complete frames present after one `recv()` (clients coalesce messages);
+  (5) warn (once per 3 s) on a stalled partial frame and dump the first 16 bytes
+- Responses are sent as two `send()` calls: 4-byte NetBIOS header (type `0x00`,
+  24-bit big-endian length) then the SMB2 message
+- On connection end: `smb_session_release_by_socket()`,
+  `smb_protocol_notify_release_by_socket()`, free buffers, close socket
 
-All SMB2 messages follow this structure:
+## Critical Wire Requirements
 
-```
-[0–3]   SMB2/SMB3 signature (0xFE, 0x53, 0x4D, 0x42 = "SMB")
-[4–63]  Fixed header (64 bytes)
-[64+]   Variable payload (command-specific)
-```
+These are non-negotiable, hardware-proven requirements. Each maps directly to a
+behaviour in `smb_protocol.c` / `smb_packet.c`.
 
-Implement parsing for:
-- Negotiate (variable)
-- SessionSetup (variable)
-- TreeConnect (variable)
-- Create (variable)
-- All others use fixed structures
+### Packet layer
 
-### Guest Authentication
+- All wire structs are `#pragma pack(1)`; verify `sizeof(smb2_header_t) == 64`
+- Access multi-byte fields through the `smb2_get/put_uXX_le()` codec, never via
+  struct casts over unaligned client data
+- `smb2_parse_header()` accepts anything ≥ 14 bytes (signature + command at
+  offset 12); fields beyond that are read only when the length allows, the rest
+  stay zero from the initial `memset`
+- Clients exist that send `structure_size != 64` (e.g. 114): warn, do not reject
+- SMB2 signature constant is the u32 `0x424d53fe` (wire bytes `fe 53 4d 42`);
+  SMB1 preamble is `0x424d53ff` (`ff 53 4d 42`)
 
-No NTLM challenge-response. Accept any SessionSetup request with username=GUEST and reply with STATUS_SUCCESS.
+### Response headers (all paths)
 
-### Share Enumeration (NetrShareEnum)
+- Echo from the last parsed request header: `command`, `message_id`, `tree_id`,
+  `session_id`. **Every** response path must echo `session_id` — including
+  hand-built headers (TREE_CONNECT originally omitted it; clients reject a tree
+  whose response carries `session_id = 0`)
+- Set `SMB2_FLAGS_SERVER_TO_REDIR`; in responses the header bytes 14..15 are
+  `CreditCount`/granted credits — grant `clamp(requested, 1, 32)`; final async
+  CHANGE_NOTIFY responses grant 0
+- Non-success responses must carry the minimal 8-byte SMB2 Error Response body
+  (`StructureSize=9, ErrorContextCount=0, Reserved=0, ByteCount=0`) — iOS clients
+  hang waiting for the 8-byte tail when it is missing
+- The shared helper memsets the body region: handlers that pre-write their body
+  into the response buffer **before** calling the helper must pass
+  `body_length = 0` and set `*response_length` manually afterwards (READ data,
+  QUERY_INFO, QUERY_DIRECTORY) — otherwise the body is zeroed after being filled
 
-Implement the remote procedure via `IPC$/srvsvc` named pipe:
+### Negotiate (0x00)
 
-```
-Operation: NetrShareEnum (0x0F)
-Input:
-  - Server name (ignored)
-  - Level (0, 1, or 2)
-Output:
-  - Share count
-  - Array of SHARE_INFO_1 or SHARE_INFO_2 structures (NDR encoded)
-  - Status code (0 = SUCCESS)
-```
+- Accept dialects `0x0202, 0x0210, 0x0300, 0x0302` (+ wildcard `0x02FF`); log
+  every offered dialect raw; select the highest accepted; never offer `0x0311`
+- Response body (64 bytes): `StructureSize=65`, `SecurityMode=1` (signing
+  advertised, never enforced), `DialectRevision=selected`, fixed `ServerGuid`
+  (`53 4d 42 32 45 53 50 33 32 2d 53 45 52 56 52 01` = "SMB2ESP32-SERVER" + 0x01),
+  `Capabilities=0`, `MaxTransact/MaxRead/MaxWrite = SMB_SERVER_MAX_IO_SIZE`,
+  `SystemTime = ServerStartTime = FILETIME(now)`,
+  `SecurityBufferOffset = 64 + 64 = 128`, `SecurityBufferLength = 0`
+- **SMB1 preamble bridge:** when the payload signature is `ff 53 4d 42`, accept
+  the request *only* if it is an SMB1 negotiate (`request[4] == 0x72`, dialect
+  block at offset 35, length u16 at offset 33) whose dialect list contains a
+  string starting `"SMB 2."`. Reply by running the normal NEGOTIATE with the
+  single dialect `0x02FF` (wildcard) — the standard multi-protocol handshake that
+  prompts the client to send a real SMB2 NEGOTIATE with its full dialect list.
+  **Never pin the legacy reply to `0x0202`:** Apple clients accept 0x0202 for
+  anonymous `IPC$` browsing but silently abandon the connection right after a
+  successful TREE_CONNECT to the real disk share. All other SMB1 requests: reject
 
-Encode share names and remarks in UTF-16LE with NDR referent pointers.
+### Session Setup (0x01) — guest, two legs, envelope mirroring
 
-For initial release: Enumerate a single share (the configured `share_name`).
+- Leg detection: `session_setup_started` flag on the connection; LOGOFF must
+  reset it (a re-login on the same TCP connection is a fresh leg 1)
+- Inspect the request security buffer: if it starts with `"NTLMSSP\0"` the client
+  wants **bare** NTLMSSP (macOS `mount_smbfs`, "Filer"); otherwise it sent
+  **SPNEGO** (iOS Files) and must get a SPNEGO-wrapped reply. Mirror the form
+  the client itself used — a mismatched envelope makes the client `LOGOFF`
+  immediately after leg 1
+- Leg 1 reply: header `status = STATUS_MORE_PROCESSING_REQUIRED`,
+  `session_id = 1`; body (8 bytes) `StructureSize=9`, `SessionFlags=0`,
+  `SecurityBufferOffset = 64 + 8 = 72`, `SecurityBufferLength` = token size.
+  The declared `StructureSize` value **9** is spec convention (fixed-size + 1),
+  **not** a byte offset — the token starts at absolute offset 72
+- Bare token = fixed 94-byte NTLMSSP type-2 Challenge: signature
+  `"NTLMSSP\0"`, type 2, target fields, flags `0x62880205`, static 8-byte server
+  challenge `01 23 45 67 89 ab cd ef`, target/NetBIOS-domain/NetBIOS-server
+  strings `"ESP32"` in UTF-16LE (target-info AV-pairs included) — copy the exact
+  byte array from `smb_protocol.c`
+- SPNEGO token = `[0]`-less `[1] NegTokenResp` DER:
+  `a1 77 30 75 | a0 03 0a 01 01` (negState accept-incomplete) `| a1 0c 06 0a
+  2b 06 01 04 01 82 37 02 02 0a` (supportedMech OID 1.3.6.1.4.1.311.2.2.10)
+  `| a2 60 04 5e` + the identical 94-byte NTLM Challenge
+- Leg 2 reply: `status = STATUS_SUCCESS`, `SessionFlags =
+  SMB2_SESSION_FLAG_IS_GUEST (0x0001)`, `SecurityBufferLength = 0`
+- The username is never parsed; all requests are accepted (guest server)
 
-## Error Handling and Robustness
+### Tree Connect (0x03) / Tree Disconnect (0x04)
 
-- Invalid SMB packet: Reply with STATUS_INVALID_PARAMETER or close connection
-- File not found: Reply with STATUS_OBJECT_NAME_NOT_FOUND
-- Access denied: Reply with STATUS_ACCESS_DENIED
-- Out of memory: Reply with STATUS_INSUFFICIENT_RESOURCES
-- Malformed DCE/RPC: Reply with fault response (status code 0x1c010002)
+- Decode the UTF-16LE path; `IPC$` = case-insensitive substring match →
+  `share_type 2`, else `share_type 1` and the path **must** contain the
+  configured share name (else `STATUS_OBJECT_NAME_NOT_FOUND`)
+- Per-connection tree table (4 slots); every successful connect gets a unique
+  id from a monotonic counter (skip 0) — MS-SMB2 2.2.9 requires unique ids for
+  concurrently open trees (clients open several `IPC$` trees at once)
+- Success body (16 bytes): `StructureSize=16`, `ShareType`, `ShareFlags=0`,
+  `Capabilities=0`, `MaximalAccess=0x001f01ff`; error path: header-only 64-byte
+  response
+- TREE_DISCONNECT frees the matching slot, then falls through to the LOGOFF
+  cleanup: `smb_session_release_by_socket()` + `notify_release_by_socket()` for
+  this connection only (never the global reset — that belongs at server start)
 
-Log all errors with ESP_LOGE() for debugging. Do not crash on malformed client input.
+### Create (0x05)
+
+- Decode `FileName` UTF-16LE → `smb_path_resolve()`: reject `..` segments,
+  drive letters (`:`), collapse separators, refuse escape from the mount point
+- On an `IPC$` tree a create for `srvsvc` (case-insensitive) allocates a **pipe**
+  handle — never a VFS path like `/littlefs/srvsvc`
+- Existence via `stat()` first. Create-action semantics: 1 = opened (existed),
+  2 = created (new), 3 = overwritten. The `3` override for
+  `FILE_OVERWRITE/FILE_OVERWRITE_IF/FILE_SUPERSEDE` applies **only when the file
+  already exists** — an unconditional override breaks the ADDED notify hook (see
+  CHANGE_NOTIFY invariants)
+- Disposition/attribute conflicts: `FILE_CREATE` on existing →
+  `OBJECT_NAME_COLLISION`; open/overwrite of missing → mapped errno
+  (typically `OBJECT_NAME_NOT_FOUND`); dir flag vs actual type mismatch →
+  `NOT_A_DIRECTORY` / `FILE_IS_A_DIRECTORY`; `read_only` config denies create /
+  truncate dispositions
+- Directories: `mkdir` (0777) when absent (unless read_only) then `opendir()` —
+  the DIR* lives on the handle. Files: `open()` O_CREAT/O_TRUNC per disposition,
+  `O_RDWR` unless read_only
+- `FILE_DELETE_ON_CLOSE` (0x00001000) sets `delete_pending` on the handle
+- **MxAc create-context:** scan the create-context chain for a 4-byte name
+  `"MxAc"`; when requested the response must append the 32-byte context
+  (`Next=0, NameOffset=16, NameLength=4, DataOffset=24, DataLength=8,` name
+  `"MxAc", QueryStatus=0, MaximalAccess=0x001f01ff`) and set the fixed body's
+  `CreateContextsOffset` at body offset 80 / `Length` at 84. macOS's kernel
+  mount path stalls (122 s timeout) when this is silently skipped
+- Response body (88 bytes): `StructureSize=89`, `OplockLevel=0`,
+  `CreateAction`, four FILETIMEs (creation/access/write/change from `stat`),
+  `AllocationSize=EndOfFile=st_size`, `FileAttributes = S_ISDIR ? 0x10 : 0x80`,
+  16-byte FileId (u64 handle id in the low 8 bytes, rest zero)
+- Genuine new objects (`create_action == 2`) fire `notify_fire(parentDir,
+  FILE_ACTION_ADDED, leaf)`
+
+### Close (0x06)
+
+- Capture `stat()` **before** releasing the handle; release the handle (closing
+  fd/DIR) **before** `unlink()`/`rmdir()` — LittleFS refuses to delete a path
+  that still has an open fd ("Has open FD")
+- Keep the pre-delete stat for the response even after a successful delete:
+  macOS's kernel client rejects a CLOSE response with all-zero attributes
+- Success body (60 bytes): `StructureSize=60`, timestamps, sizes, attributes from
+  the captured stat
+
+### Read (0x08) / Write (0x09)
+
+- READ: pipes answer `STATUS_END_OF_FILE`; directories answer
+  `STATUS_FILE_IS_A_DIRECTORY`; read past EOF → `STATUS_END_OF_FILE`; clamp the
+  requested length to the response capacity
+- READ response: `StructureSize=17`, `DataOffset` (u8) = `64 + 16`,
+  `DataLength`; data directly into the buffer after the 16-byte body; use the
+  `body_length = 0` helper trick
+- WRITE: bounds-check `DataOffset`/`DataLength` against the frame; `read_only` →
+  `STATUS_ACCESS_DENIED`; directory/pipe handles → `STATUS_FILE_IS_A_DIRECTORY`;
+  offset write via lseek+write wrapper
+- WRITE response: `StructureSize=17`, `Count = bytes written`
+
+### Query Info (0x10)
+
+- `info_type == SMB2_0_INFO_FILESYSTEM`: only `FileFsSizeInformation` (class 3),
+  else `STATUS_NOT_SUPPORTED`. ESP-IDF's VFS has no generic `statvfs()`, so
+  report **static placeholders**: 512 MB total, 256 MB free, 512-byte sectors
+  (`SectorsPerAllocationUnit=1`) — a deliberate design choice to stay
+  filesystem-agnostic. Output 24 bytes (FILE_FS_SIZE_INFORMATION):
+  `TotalAllocationUnits = 512MB/512`, `AvailableAllocationUnits = 256MB/512`,
+  `SectorsPerAllocationUnit = 1`, `BytesPerSector = 512`; response
+  `OutputBufferOffset = 64 + 8 = 72`, `OutputBufferLength = 24`
+- `info_type == SMB2_0_INFO_FILE` classes (from `stat`): `FileBasicInformation`
+  (40 B), `FileStandardInformation` (24 B), `FileNetworkOpenInformation` (56 B),
+  `FileAllInformation` (100 B + UTF-16 name); other classes →
+  `STATUS_NOT_SUPPORTED`
+- FILETIME conversion: `(unix_seconds + 11644473600) * 10000000`
+- Any other `info_type` → `STATUS_NOT_SUPPORTED`
+
+### Set Info (0x11)
+
+- `FileDispositionInformation`: set/clear `delete_pending` from the first byte;
+  read_only → `STATUS_ACCESS_DENIED`
+- `FileEndOfFileInformation`: `ftruncate` to the u64 value; read_only/dir/pipe →
+  `STATUS_ACCESS_DENIED`
+- `FileBasicInformation`: acknowledge without applying (timestamps/attributes are
+  not persisted)
+- Success body **must** contain `StructureSize = 2` (2 bytes) — MS-SMB2 2.2.39.
+  A zeroed SET_INFO response (the header helper's memset silently did this once)
+  makes macOS report `fts_read: RPC struct is bad` on every `rm`
+
+### Query Directory (0x0e)
+
+- Only `FileIdBothDirectoryInformation` (class 37); else `STATUS_NOT_SUPPORTED`;
+  non-directory handle → `STATUS_NOT_A_DIRECTORY`
+- `SL_RESTART_SCAN (0x01)` → `rewinddir()`; `SL_RETURN_SINGLE_ENTRY (0x02)` →
+  return exactly **one** matching entry then stop (protocol violation otherwise
+  — Finder polls with `flags=0x03` + a specific filename)
+- Honour the request `FileName` search pattern: decode UTF-16LE (low byte per
+  code unit), case-insensitive DOS wildcard match (`*`, `?`); empty pattern or
+  `"*"` matches everything; non-matching `readdir()` results are skipped —
+  without filtering, single-entry probes always return the first entry and
+  polling clients spin forever
+- Entry encoding (`FILE_ID_BOTH_DIR_INFORMATION`): 104-byte fixed part + UTF-16LE
+  name + 2-byte null; all four timestamps = change-time FILETIME;
+  `EndOfFile = st_size`; `AllocationSize = roundup(st_size, 4096)`;
+  **`FileAttributes` = `0x10` dir / `0x80` (FILE_ATTRIBUTE_NORMAL) file — `0` is
+  invalid and Finder silently drops such entries**; `FileNameLength` excludes the
+  null; `EaSize=0`, `ShortNameLength=0`, ShortName left zeroed; `FileId = st_ino`
+- Entries are 8-byte aligned; **zero the alignment padding** (the response
+  buffer is reused across requests and stale bytes leak onto the wire);
+  `NextEntryOffset` of the previous entry is back-patched with the previous
+  entry's *aligned* size once the next entry's offset is known; last entry's
+  `NextEntryOffset = 0`
+- No matching entries → `STATUS_NO_MORE_FILES (0x80000006)` (this is also the
+  correct answer for AppleDouble `._*` probes that do not exist — it is not a bug)
+- Response body: `StructureSize=9`, `OutputBufferOffset = 72`,
+  `OutputBufferLength = bytes used`
+
+### IOCTL (0x0b) — FSCTL_PIPE_TRANSCEIVE (0x0011C017)
+
+- IOCTL request body parse: `CtlCode` at body+4, `InputOffset` at body+24,
+  `InputCount` at body+28; validate against the frame before touching
+- Unsupported control codes still get a well-formed response: 48-byte body,
+  `StructureSize=49`, CtlCode echoed at +4, FileId (16 B) echoed at +8, all
+  offsets/counts zero, `STATUS_NOT_SUPPORTED`
+- **BIND** (DCE/RPC common header `ptype` at input byte 2 == `0x0b`,
+  `InputCount >= 16`): reply with the fixed **56-byte BIND_ACK template**
+  (bytes, verbatim — hardware-validated):
+  `05 00 0c 03 10 00 00 00 38 00 00 00 00 00 00 00 b8 10 b8 10 00 00 00 00
+  00 00 00 00 01 00 00 00 00 00 00 00 04 5d 88 8a eb 1c c9 11 9f e8 08 00
+  2b 10 48 60 02 00 00 00`
+  with bytes 12..15 (Call ID) overwritten from request bytes 12..15
+- **REQUEST** (`ptype == 0x00`, `InputCount >= 24`, opnum u16 at input offset 22
+  == `0x000f`) → NetrShareEnum. IOCTL response: `StructureSize=49`, CtlCode
+  echo, FileId echo, `OutputOffset = 64 + 48`, `OutputCount` = NDR blob length,
+  NDR blob appended at body+48
+- **NetrShareEnum NDR32 blob** — exact layout (fields after the 24-byte
+  DCE/RPC RESPONSE header; this layout is the hardware-validated one, do not
+  "improve" it):
+  - DCE/RPC RESPONSE header (24 B): version 5, minor 0, `ptype=2`,
+    `pfc_flags=0x03`, data rep `10 00 00 00`, fragment length u16 at +8,
+    auth version 0 at +10, Call ID u32 at +12 copied from the request, stub
+    length (`blob_len − 24`) u32 at +16, cancel count u16 0 at +20, reserved
+    `00 00` at +22..23
+  - Stub: `Level=1`, union `switch_is=1`, container unique-pointer
+    `0x00020000`, then deferred: `EntriesRead=1`, buffer pointer `0x00020004`,
+    conformant array `MaximumCount=1`
+  - `SHARE_INFO_1`: NetName pointer `0x00020008`, `Type=0`, Remark pointer
+    `0x0002000c`
+  - Deferred conformant-varying share name: `max_count = actual_count =
+    len+1`, `offset=0`, UTF-16LE chars **including the null terminator**, pad to
+    4-byte boundary
+  - Deferred empty remark: `max=1, offset=0, actual=1`, single UTF-16 null, pad
+    to 4-byte boundary
+  - Output params in order: `TotalEntries=1`, `ResumeHandle=0`, `WERROR=0`
+- Missing `EntriesRead` or the array `MaximumCount` shifts every following field
+  by 4/8 bytes and corrupts the whole NDR stream (the classic
+  "smbutil: Broken pipe" failure); derive from `srvsvc.idl` if in doubt
+
+### Compound (chained) requests
+
+- Loop over sub-commands using each header's `NextCommand` (0 = last); a
+  missing compounding loop makes `mount_smbfs` hang exactly ~122 s (the kernel
+  waits forever for a response to the chained CREATE+QUERY_INFO+CLOSE)
+- Sub-commands carrying `SMB2_FLAGS_RELATED_OPERATIONS` must have their FileId
+  (at `offsetof(..., file_id)` for CLOSE/READ/WRITE/QUERY_INFO/SET_INFO/
+  QUERY_DIRECTORY/CHANGE_NOTIFY) replaced by the FileId of the **preceding
+  successful CREATE in the same chain**
+- Every non-final sub-response is zero-padded to an 8-byte multiple;
+  `NextCommand` = padded length; final = 0
+- Cap the chain at `SMB_SERVER_MAX_COMPOUND_COMMANDS` (16); on a malformed
+  chain or failed sub-parse mid-chain, truncate gracefully by zeroing the
+  previous response's `NextCommand` (never fail the whole frame after already
+  having answered part of it)
+
+### Locks, Flush, Echo, Cancel
+
+- FLUSH: header-only `STATUS_SUCCESS`
+- LOCK: always granted, header-only `STATUS_SUCCESS` (MS-SMB2 2.2.30 defines no
+  response body; locks were never enforced anyway — Samba `locking = off`
+  behaviour; `STATUS_NOT_SUPPORTED` here is fatal for stricter clients)
+- ECHO: 4-byte body `{StructureSize=4}`
+- CANCEL: never answered (sync or async). Async cancel reads the target's
+  `AsyncId` from the request's `reserved`/`tree_id` header word pair and marks
+  the matching pending watch cancelled
+
+### CHANGE_NOTIFY (0x0f) — async directory watch
+
+Design (the VFS has no change-event API and each connection has exactly one
+blocking `recv()`):
+- Fixed 8-slot watch table + its own mutex; slot stores `socket`, `file_id`,
+  `watched_path`, `watch_tree`, `completion_filter`, `message_id`, `session_id`,
+  `async_id` (monotonic, never 0), `fired`, `result_status`, `action`, `name`
+- Register → immediate interim response: header `flags |= ASYNC_COMMAND`,
+  `status = STATUS_PENDING (0x00000103)`, AsyncId split across the header's
+  `reserved` (low 32) and `tree_id` (high 32) words (the same wire bytes the
+  sync header uses there), 8-byte Error-Response-shaped body
+  (`StructureSize=9`)
+- Hooks: CREATE with `create_action == 2` → `FILE_ACTION_ADDED`; successful
+  delete-on-close → `FILE_ACTION_REMOVED`; match on watched path (exact, or
+  ancestor when `SMB2_WATCH_TREE`)
+- The owning connection's 1 s `SO_RCVTIMEO` recv-timeout tick calls the notify
+  poll: for each fired watch of this socket, send the final async response —
+  header `ASYNC_COMMAND | SERVER_TO_REDIR`, original `message_id`/`session_id`,
+  granted credits 0, body `StructureSize=9`, `OutputBufferOffset=72`, then
+  `FILE_NOTIFY_INFORMATION` (single entry: next=0, action, FileNameLength,
+  UTF-16LE name); cancelled watches send the status without body payload, then
+  free the slot
+- Cleanup: close of the watched handle frees its watch (by file id);
+  TREE_DISCONNECT / LOGOFF / disconnect free this socket's watches
+- **Three accepted spec deviations:** (1) all matching watches fire on an event
+  instead of strict per-handle FIFO; (2) TREE_DISCONNECT cleanup is
+  connection-wide, not tree-scoped (slots don't track tree ids); (3) no
+  `CompletionFilter` bit-matching — any watched-path change fires regardless of
+  the requested filter
+
+**CHANGE_NOTIFY invariants (do not reintroduce these two bugs):**
+1. A watch's "fired" state is the dedicated `bool fired` — **never** test
+   `result_status != 0`: `STATUS_SUCCESS` is `0x00000000`, identical to the
+   "still pending" sentinel, and the zero-check silently swallows every final
+   response. `register`/`fire`/`cancel`/`poll` all read/write `fired`; read
+   `result_status` only once `fired == true`.
+2. `create_action` stays `2` (FILE_CREATED) for a genuinely new file even under
+   `FILE_OVERWRITE/FILE_OVERWRITE_IF/FILE_SUPERSEDE`; force `3` only when the
+   file exists. The ADDED fire-hook depends on this value being accurate.
+
+### Handle / session state
+
+- Handle table is global (24 slots) guarded by one mutex; every slot records
+  `owner_socket`. Single-handle release closes fd/DIR and frees pipe buffers;
+  `release_by_socket()` releases only that connection's handles; the global
+  reset runs once at server start before any client connects — a per-client
+  TREE_DISCONNECT/LOGOFF must never call it (it would close every other client's
+  open files)
+- Connection context (`smb_protocol_context_t`): socket, `session_setup_started`,
+  tree table + `next_tree_id`, `last_request_header` (the single source for all
+  echoed response ids)
+
+### Path security
+
+- UTF-16LE → UTF-8 decoder: BMP only (1–3 byte UTF-8), even input length, stop
+  at null
+- `smb_path_resolve()`: trailing-slash trimming on the mount point, collapse
+  `/` and `\`, drop `.` segments, **reject** `..` (containment), reject any
+  segment containing `:` (drive letters / ADS-style paths); overflow-checked
+  against the output buffer
+
+### Error handling
+
+`errno` → NTSTATUS mapping (code: `smb_protocol_status_from_errno`):
+
+| errno | NTSTATUS |
+|---|---|
+| `ENOENT` | `STATUS_OBJECT_NAME_NOT_FOUND` |
+| `ENOTDIR` | `STATUS_NOT_A_DIRECTORY` |
+| `EISDIR` | `STATUS_FILE_IS_A_DIRECTORY` |
+| `EEXIST` | `STATUS_OBJECT_NAME_COLLISION` |
+| `EACCES`/`EPERM`/`EBADF` | `STATUS_ACCESS_DENIED` |
+| `ENOSPC` | `STATUS_DISK_FULL` |
+| `ENOTEMPTY` | `STATUS_DIRECTORY_NOT_EMPTY` |
+| other | `STATUS_INVALID_PARAMETER` |
+
+Other rules: malformed DCE/RPC would warrant a fault PDU (`0x1c010002`) per
+spec; the current code simply answers `STATUS_NOT_SUPPORTED` IOCTL responses —
+acceptable for guest scope. Never crash on malformed client input; log with
+`ESP_LOGE`.
+
+### Logging
+
+- `ESP_LOGE/W/I/D` only (no printf); tags: `smb_server`, `smb_protocol`,
+  `smb_packet`, `smb_session`, `smb_vfs`
+- All per-packet hex dumps (`smb_protocol_dump_packet`) stay at `ESP_LOGD` so
+  they never flood the console; framing-desync WARNs (oversized frame, wrong
+  NetBIOS type, stalled partial frame) include the first 16 buffer bytes as
+  evidence
 
 ## Validation Criteria (Mandatory Before Completion)
 
@@ -285,30 +721,26 @@ Log all errors with ESP_LOGE() for debugging. Do not crash on malformed client i
 
 ### macOS Validation
 
-1. `smbutil view -G '//guest@<ESP_IP>'` 
+1. `smbutil view -G '//guest@<ESP_IP>'`
    - Completes without hanging
    - Lists the configured share name (e.g., "ESP32")
    - No "Broken pipe" error
-
 2. Finder **Go > Connect to Server** with `smb://guest@<ESP_IP>/ESP32`
-   - Share mounts successfully
-   - Lists directory contents
-   - No "connection timeout" or "connection refused" errors
-
-3. File operations on mounted share:
-   - List directory: Works
-   - Read existing file: Works
-   - Create new file: Works
-   - Write to file: Works
-   - Read back written file: Matches original content
-   - Delete file: Works (if not read-only)
-   - Delete directory: Works (if not read-only)
+   - Share mounts successfully; directory contents listed
+3. `mount_smbfs -N smb://guest@<ESP_IP>/ESP32 /mnt/esp32` succeeds
+   (kernel-path mount — this exercises compounding, MxAc and
+   FileFsSizeInformation; `smbutil` alone does NOT)
+4. File operations on the mounted share:
+   - List / read / create / write / read-back / delete file: all work
+   - `mkdir` / `rmdir`: work
+   - Multi-PDU transfer: `dd` a ≥100 KB file, `cp` + `diff` byte-exact
+   - `rm` of a just-written file completes with no `RPC struct is bad`
+5. Finder GUI shows the files (not only command-line `ls`)
 
 ### Windows Validation (if available)
 
 1. `net view \\<ESP_IP>` lists the share
-2. File Explorer can mount and browse the share
-3. Read/write/delete operations work
+2. Explorer mounts and browses; read/write/delete work
 
 ### Linux Validation (if available)
 
@@ -316,163 +748,61 @@ Log all errors with ESP_LOGE() for debugging. Do not crash on malformed client i
 2. File operations work (read, write, delete)
 3. `umount /mnt/esp32` succeeds
 
+### iOS Validation
+
+1. Files app / "Filer": SESSION_SETUP completes (bare or SPNEGO envelope,
+   whichever the client sent), disk share connects, listing + copy work
+
 ### Device Logging Validation
 
-- All protocol logs are captured with timestamps
-- No memory corruption or stack overflows
-- Heap usage remains within 50% of available
+- Protocol logs captured with timestamps; no memory corruption or stack overflows
+- Heap usage within 50% of available
 - TCP connections close cleanly
-
-## Patch Log
-
-**Update This Patch Log after Every Major Change of Code**
-
-**MIND YOU: The first Column is DATE+TIME**
-
-Phases below are grouped by root-cause area rather than by calendar week: once a group of patches was proven to work together on hardware, its tables were merged under one phase heading. `fase2Plan.md` (an interim scratch-status file) has been fully folded into this log and removed.
-
-### Phase 1 — Protocol Foundation (done)
-
-| Date & Time | Work Done | Evidence | Status |
-|-----------|-----------|----------|--------|
-|  2026-08-18 08:15 | Decision: Abandon libsmb2, pivot to custom SMB2 | libsmb2 IOCTL output buffer serialization impossible; custom protocol handler required | Decision finalized |
-|  2026-08-18 09:30 | Created smb_packet.h/c: SMB2 structures, little-endian codec, header parser/builder | Compiled; validates signature and structure_size | Foundation ✓ |
-|  2026-08-18 10:45 | Created smb_protocol.c: TCP listener (port 445), per-client tasks, stack-allocated 8KB buffers | Server binds port 445, accepts connections; heap-safe | Networking ✓ |
-|  2026-08-18 11:00 | Implemented Negotiate, SessionSetup, TreeConnect handlers | Handlers compile; build succeeds | Core handlers ✓ |
-|  2026-08-18 12:30 | Debugged NetBIOS frame header detection; relaxed structure_size validation (client sends 114 not 64) | smbutil connects, Negotiate response sent (112 bytes) | Handshake works ✓ |
-| 2026-08-18 13:00 | Added NetBIOS frame wrapping to responses; adjusted min payload check to 14 bytes | Client receives Negotiate response, progresses to SessionSetup | Protocol OK ✓ |
-| 2026-08-18 14:00 | Fixed response header serialization: use smb2_build_header() + little-endian puts for all fields | Negotiate/SessionSetup/TreeConnect responses now properly serialized | Struct alignment ✓ |
-| 2026-08-18 14:15 | Added #pragma pack(1) to SMB2 structures to prevent compiler padding/alignment issues | Struct sizeof verified as 64 bytes; all field offsets correct | Alignment fix ✓ |
-| 2026-08-18 14:30 | BLOCKER: Client sends repeated Negotiate requests (SMB 3.1.1 Negotiate Context behavior) | Client receives 129-byte Negotiate response but rejects it; retries with different contexts | BLOCKED: Need Negotiate Context support |
-
-### Phase 2 — Disk Share Access, Directory Enumeration & IPC$/NetrShareEnum (done, merged from former Fase2/Fase3/Fase4)
-
-| Date & Time | Work Done | Evidence | Status |
-|-----------|-----------|----------|--------|
-| 2026-08-18 13:56-14:34 | Implemented disk/session foundation: UTF-16LE path decoding, traversal-safe VFS resolution, file/directory/pipe handles, mutex protection, delete-on-close state, CREATE/CLOSE/READ/WRITE/QUERY_INFO/SET_INFO handlers, NTSTATUS mapping, cleanup, and corrected SMB2 CREATE offsets | Repeated ESP-IDF v6.0.2 builds succeed; authentication and disk-share CREATE/root handling are reached on hardware | Implemented; file I/O and directory listing still needed hardware validation |
-| 2026-08-18 13:56-15:02 | Fixed SMB2 wire foundation: true SMB2 signature `fe 53 4d 42`, packed structures, correct negotiate body (`ServerGuid`, sizes, times, offsets), credits, ECHO, and response serialization | `smbutil` progresses beyond negotiate/session setup; previous `RPC struct is bad` and credit stalls are resolved | Implemented |
-| 2026-08-18 13:56-14:24 | Added SMB1 multi-protocol negotiate bridge: accept initial SMB1 `ff 53 4d 42` negotiate only when it offers SMB2 (`SMB 2.002`), then continue as SMB2 dialect `0x0202`; SMB1 operations remain unsupported | Device logs `SMB1 negotiate offered SMB2`; SMB2 response uses `fe 53 4d 42` | Implemented by design |
-| 2026-08-18 14:07-14:31 | Implemented guest authentication interoperability: raw NTLMSSP type-1 detection, raw type-2 challenge, target name `ESP32`, target-info AV-pairs, two-step status flow, final `IS_GUEST` flag, and diagnostic token logging | Hardware reaches `STATUS_MORE_PROCESSING_REQUIRED`, receives NTLMSSP type 3, then gets `STATUS_SUCCESS` and proceeds to Tree Connect | Implemented; cryptographic validation is intentionally guest-only |
-| 2026-08-18 14:45-15:02 | Added IPC$ routing: recognize `\\host\IPC$`, return pipe share type, and allocate `srvsvc` as a named-pipe handle instead of `/littlefs/srvsvc` | Hardware reaches `CREATE srvsvc pipe` and continues to `FSCTL_PIPE_TRANSCEIVE` | Implemented |
-| 2026-08-18 14:47-15:15 | Added SMB2 IOCTL/pipe flow and DCE/RPC BIND support: log IOCTL input, recognize `0x0011c017`, return a 56-byte NDR32 `BIND_ACK`, handle ECHO/credits, and avoid abrupt socket closes | Hardware logs `DCE/RPC BIND acknowledged` and sends a 168-byte IOCTL response | Implemented; pipe buffering/REQUEST response still pending |
-| 2026-08-18 15:12-15:15 | Blocker before the NDR slice: DCE/RPC REQUEST for `NetrShareEnum` was not implemented; empty pipe READ returned EOF, so `smbutil` showed the share header but ended with `Broken pipe` or waited | BIND was reached and acknowledged, but no share row was returned; request opnum is `0x000f` | Superseded by NDR implementation |
-| 2026-08-19 14:30 | Implemented first NDR32 `NetrShareEnum` response path for DCE/RPC REQUEST opnum `0x000f`; encodes one configured `SHARE_INFO_1` share (`ESP32`) and returns it through SMB2 `FSCTL_PIPE_TRANSCEIVE` output | ESP-IDF v6.0.2 `idf.py build` succeeds; binary generated; hardware validation and NDR interoperability remained pending | Implemented, hardware validation pending |
-| 2026-08-19 14:44 | Corrected NDR `SHARE_INFO_1` deferred-pointer ordering: name pointer, share type, remark pointer now precede deferred UTF-16 string data | Previous hardware run sent `NetrShareEnum response` but macOS returned `Broken pipe` after waiting; ESP-IDF v6.0.2 build succeeds | Implemented, hardware validation pending |
-| 2026-08-19 14:49 | Added temporary full DCE/RPC response dump for `NetrShareEnum` to diagnose the remaining macOS NDR parsing failure | ESP-IDF v6.0.2 `idf.py build` succeeds; hardware validation pending | Diagnostic probe |
-| 2026-08-19 14:53 | Corrected NDR `SHARE_INFO_1` share-name encoding to include the required null-terminated UTF-16LE code unit and adjusted conformant string counts | ESP-IDF v6.0.2 `idf.py build` succeeds; hardware validation pending | Implemented, hardware validation pending |
-| 2026-08-19 15:13 | Rebuilt the NetrShareEnum stub from Samba `srvsvc.idl`: level 1, `NetShareCtr1`/`NetShareInfo1`, deferred name/comment strings, totalentries, null resume handle, and WERROR in IDL order | ESP-IDF v6.0.2 `idf.py build` succeeds; hardware validation pending | Implemented from reference, hardware validation pending |
-| 2026-08-19 15:45 | Fixed remark string NDR encoding: changed from `(max_count=1, offset=0, actual_count=1)` + null terminator to `(max_count=0, offset=0, actual_count=0)` for empty string conformant varying array | Build succeeds; hardware test shows NetrShareEnum response sent (104 bytes) but macOS still reports `Broken pipe` after close, suggesting NDR unmarshaling still fails | Attempt 1: response structure correct but content rejected |
-| 2026-08-19 16:00 | Revised deferred pointer strategy: changed all pointer markers from incrementing values `(0x00020000, 0x00020004, 0x00020008, 0x0002000c)` to uniform `0x00020000` for all union/struct pointers | Build succeeds; hardware test shows identical response but macOS still returns `Broken pipe`; client closes pipe immediately after receiving response instead of parsing it | Attempt 2: pointer uniformity did not fix NDR unmarshaling rejection |
-| 2026-08-19 16:15 | Implemented pipe response buffering: (1) IOCTL handler queues NetrShareEnum response into `pipe_response` buffer instead of returning in IOCTL output; (2) READ handler checks buffer and returns data in chunks; (3) CLOSE handler frees buffer via existing `smb_session_release()`. Rationale: macOS pipes expect stream semantics (fragments), not one-shot responses | ESP-IDF v6.0.2 `idf.py build` succeeds | Attempt 3: buffering strategy rejected by client. Client sees IOCTL output_count=0 and closes pipe immediately without READ. Reverted. |
-| 2026-08-19 16:30 | Reverted buffering; returned to direct IOCTL response (92-byte NDR NetrShareEnum). Built and flashed. | Device logs: NetrShareEnum response sent (92 bytes); client responds with ECHO pings (cmd=0x0d) then timeout disconnect. smbutil output: still "Broken pipe" | **BLOCKING ISSUE CONFIRMED**: NDR response structure is sent (92 bytes) but macOS NDR unmarshaler rejects it. Client cannot parse the response and closes connection. Root cause: NDR encoding mismatch with Samba/Windows expectations. Proceeding with QUERY_DIRECTORY/disk operations; returned to NetrShareEnum debugging after validating core file I/O. |
-| 2026-08-19 17:45 | **Attempt 4 (Complete MS-SRVS Rewrite):** Rewrote NetrShareEnum from MS-SRVS specification: proper SHARE_ENUM_STRUCT with level discriminator, union discriminator, SHARE_CTR1 pointer to array, SHARE_INFO_1 base (NetName ptr, Type=0, Remark ptr), deferred conformant varying arrays for strings, output parameters (TotalEntries, ResumeHandle, Status), and reconstructed DCE/RPC RESPONSE header | Build succeeds (925 KB); hardware test: protocol succeeds NEGOTIATE→SESSION_SETUP→TREE_CONNECT→CREATE; Finder error "There was a problem connecting to the server"; share does not appear in browser | Attempt 4: FAILED — macOS still rejected the NDR response despite following the MS-SRVS spec; fixed in the row below |
-| 2026-08-19 17:15 | QUERY_DIRECTORY handler (0x0e) implemented | SMB2 command routing added; FILE_ID_BOTH_DIRECTORY_INFORMATION (level 104) encoding with readdir(); Unix-to-FILETIME conversion; 8-byte entry alignment; STATUS_NO_MORE_FILES (0x80000006); path length validation | ✅ Build succeeds; firmware 925 KB; ready for hardware test |
-| 2026-08-19 17:30 | QUERY_DIRECTORY stack-optimized & hardware validated | Stack overflow fixed: reduced buffers from ~1KB to ~256 bytes per loop. Direct UTF-16LE encoding to response buffer instead of intermediate 256-byte buffer. Client successfully connects and mounts share. No crash. | ✅ Finder mounts smb://192.168.12.2/ESP32 successfully; ECHO keepalives working; clean disconnect |
-| 2026-08-19 18:00 | **Tree Connect path validation fix:** Added share name validation to Tree Connect handler. Disk shares now MUST contain the configured share name (`ESP32`). Return STATUS_OBJECT_NAME_NOT_FOUND (0xc0000034) for invalid paths. Assign tree_id=0 on error, tree_id=1 on success. Send header-only response on errors. | Build succeeds; hardware test: Tree Connect correctly accepts `\\ESP32 SMB Server._smb._tcp.local\ESP32` (status=0x00000000, tree_id=1); mount_smbfs still failed with "Operation not permitted" | ✅ Tree Connect validation working; mount_smbfs still blocked pending the NetrShareEnum fix below |
-| 2026-08-21 09:15 | **NDR `SHARE_INFO_1_CONTAINER` layout fix:** Corrected the `NetrShareEnum` IOCTL response encoding to include the previously-missing `EntriesRead` field and `Buffer` conformant-array `MaximumCount` header before the `SHARE_INFO_1` array (both had been skipped, shifting every following field by 8 bytes and corrupting the NDR stream) | Build succeeds; hardware test: `smbutil view -G '//guest@192.168.12.2'` now completes and prints `ESP32  Disk` — "1 shares listed", no Broken pipe | ✅ **RESOLVED** — NetrShareEnum NDR encoding now interoperable with macOS |
-| 2026-08-21 09:45 | **Stack overflow crash fix:** `smb_protocol_client_handler` task was created with only 6144-byte stack but allocated two 8192-byte buffers (16 KB) plus context on the stack — guaranteed overflow causing `Guru Meditation Error (InstrFetchProhibited)` crashes in `lwip_recvfrom` on client connect. Changed `request_buffer`/`response_buffer` to heap allocation (`malloc`/`free`) instead of stack arrays | Build succeeds; hardware test: `smbutil view -G '//guest@192.168.12.2'` completed cleanly (msg_id 0-20, ECHO keepalives from t=24885ms to t=134705ms), no crash, no Guru Meditation | ✅ **RESOLVED** — hardware validated, no more stack-overflow crash |
-
-### Phase 3 — Finder/macOS Kernel-Mount (`mount_smbfs`) Interoperability & Full Disk I/O Validation (done, merged from former Fase4 continuation)
-
-| Date & Time | Work Done | Evidence | Status |
-|-----------|-----------|----------|--------|
-| 2026-08-21 13:10 | **Investigated `mount_smbfs`/Finder-sidebar mount failures** ("Operation not permitted" / "Operation timed out") despite Tree Connect + CREATE succeeding on the wire (confirmed via tcpdump capture and macOS unified log). macOS's kernel `smbfs` mount path (`smb_mount()`) fails/times out client-side even though our SMB2 responses are well-formed; a wire capture showed the CREATE request includes an `"MxAc"` (Query Maximal Access) create-context that our server silently ignored (spec-legal, but a plausible reason the kernel client stalls). Added CREATE-context parsing + an `MxAc` response (`smb_protocol_create_request_wants_mxac`, `smb_protocol_append_mxac_context`) returning `MaximalAccess=0x001f01ff` when requested | Build succeeds; hardware validation of whether this resolves `mount_smbfs`/Finder-sidebar mounting is pending | Implemented from wire-capture evidence, hardware validation pending |
-| 2026-08-21 13:20 | **MxAc fix retested — did not resolve `mount_smbfs` timeout.** CREATE response now correctly includes the 32-byte MxAc context (184 bytes total sent), but `mount_smbfs` still fails identically. Diagnosed with `log stream --predicate 'process == "mount_smbfs"'`: `smb_mount()` is called, then **exactly 122 seconds later** fails with `syserr = Operation timed out`, with **zero** further client-side log activity or wire traffic in between (ESP32 session stays healthy with ECHO keepalives throughout) | Confirms this is a fixed ~122s internal timeout in the macOS kernel `smbfs` mount(2) path itself, not caused by any specific missing SMB2 response field | ⚠️ Root cause still open at this point; fixed in the row below |
-| 2026-08-22 | **Root cause found: SMB2 request compounding was not implemented.** Wire log showed the kernel `mount_smbfs` path sends chained sub-commands (e.g. CREATE+QUERY_INFO+CLOSE) in a single TCP payload via each header's `next_command` offset; the server only ever processed the first sub-command and silently dropped the rest, so the client waited forever for a response to the chained command it never got — explaining the fixed ~122s kernel timeout. Refactored `smb_protocol_process_request` into a loop over chained sub-commands: added `smb_protocol_related_file_id_offset()` to substitute the FileId of `SMB2_FLAGS_RELATED_OPERATIONS` sub-commands with the FileId from the preceding CREATE in the same chain, built padded (8-byte aligned) chained responses with correct `next_command` offsets | Build succeeds; hardware test: device log shows CREATE(compound)+QUERY_INFO(compound)+CLOSE all parsed and answered in one 372-byte response; no more 122s hang, clean TREE_DISCONNECT within ~300ms | ✅ **RESOLVED** — compounding hang fixed; `mount_smbfs` now fails fast with a new, different error: `"Operation not supported"` |
-| 2026-08-22 14:00 | **Diagnosed new fast-fail error via added diagnostic log.** Added a log line printing `info_type`/`info_class` in `smb_protocol_handle_query_info()`. Confirmed the chained QUERY_INFO in the CREATE+QUERY_INFO+CLOSE sequence requests `info_type=0x02` (`SMB2_0_INFO_FILESYSTEM`), `info_class=3` (`FileFsSizeInformation`) — a filesystem/volume-size query the handler didn't support at all, unconditionally returning `STATUS_NOT_SUPPORTED` for any non-`SMB2_0_INFO_FILE` request, which macOS surfaces verbatim as `"Operation not supported"` | Diagnostic log confirmed exact info_type/info_class values from hardware before implementing a fix | Diagnosis confirmed; root cause identified |
-| 2026-08-23 11:25 | **Implemented `FileFsSizeInformation` support and validated full `mount_smbfs` mount.** Since ESP-IDF's VFS layer has no generic `statvfs()` API for an arbitrary mount point, added a `SMB2_0_INFO_FILESYSTEM`/`FileFsSizeInformation` branch in `smb_protocol_handle_query_info()` that reports static placeholder volume-size values (512 MB total / 256 MB free, 512-byte sectors) — a deliberate design choice (confirmed with user) to keep the component filesystem-agnostic rather than depending on a specific backing FS (e.g. LittleFS) or changing the public `smb_server_config_t` API | Build succeeds; hardware test: `mount_smbfs -N 'smb://guest@192.168.12.2/ESP32' /tmp/esp32test` now succeeds — `mount` shows `//guest:@192.168.12.2/ESP32 on /private/tmp/esp32test (smbfs, ...)`; subsequent traffic shows healthy repeating CREATE+QUERY_DIRECTORY+CLOSE and CREATE+QUERY_INFO+CLOSE polling with no errors | ✅ **RESOLVED** — `mount_smbfs` kernel-path mount fully working; both the compounding hang and the FileFsSizeInformation gap are fixed |
-| 2026-08-23 11:31 | **Validated real disk file I/O over the mounted share.** With `/tmp/esp32test` mounted via `mount_smbfs`, ran `ls -la`, `echo "hello esp32" > test.txt`, `cat test.txt`, and `rm test.txt` from the macOS client | Client-side transcript: `ls -la` showed the empty root; `echo`+`cat` round-tripped `hello esp32` correctly; after `rm`, `ls -la` showed the directory empty again | ✅ **RESOLVED** — CREATE (with write access), WRITE, READ, and delete-on-close (SET_INFO `FileDispositionInformation` + CLOSE) all validated end-to-end on hardware |
-| 2026-08-23 11:35 | **Validated directory create/delete and multi-chunk file I/O over the mounted share.** Ran `mkdir subdir`, `dd` a 100 KB file, `cp`+`diff` to verify byte-exact readback, then `rm`/`rmdir` from the macOS client | Client-side transcript: `mkdir` and `ls -la` showed the new `subdir`; `dd` wrote 102400 bytes; `diff` against the local copy reported `MATCH`; `rm`/`rmdir` cleaned up successfully | ✅ **RESOLVED** — directory CREATE/QUERY_DIRECTORY/delete and multi-PDU READ/WRITE (100 KB spans several SMB2 READ/WRITE requests) validated end-to-end on hardware |
-
-### Phase 4 — Finder GUI Directory Listing Bug (in progress — command-line `mount_smbfs` works, Finder GUI does not yet show files)
-
-Despite Phase 3's `mount_smbfs`/command-line validation passing, the user reported that files placed in the `ESP32` share (`hello.txt`, `notes/`, `welcome.txt`) still do not appear when browsing the mounted share through the Finder GUI, even though the device log shows correct QUERY_DIRECTORY responses being built and sent.
-
-| Date & Time | Work Done | Evidence | Status |
-|-----------|-----------|----------|--------|
-| 2026-08-23 (session) | Fixed invalid `file_info_class` check and two response-corruption bugs (a broken `NextEntryOffset` backpatch loop, and a mis-positioned `FileId` field) in the QUERY_DIRECTORY response encoder | Build succeeds | Fixed, but user reported "Helaas! Nog steeds niet!" (still not working) — Finder still showed no files |
-| 2026-08-23 (session) | Root-caused and fixed: QUERY_DIRECTORY handler ignored the `SL_RETURN_SINGLE_ENTRY` (0x02) request flag (MS-SMB2 2.2.33) and always packed every directory entry into one response, even when the client's first query explicitly asked for exactly one entry (`flags=0x03`) — a protocol violation that is a plausible reason for macOS to silently discard the response. Added `SL_RESTART_SCAN`/`SL_RETURN_SINGLE_ENTRY` flag handling and a `break` after the first entry when single-entry mode is requested | Build succeeds; latest hardware log confirms the fix is active (`flags=0x03` now correctly returns exactly 1 entry / 128 bytes instead of all 3) | Confirmed on the wire; user reports the overall symptom ("still not working") persists — root cause of the remaining Finder GUI display issue is still open |
-| 2026-08-23 14:27 | Documentation consolidation: merged `fase2Plan.md` into this Patch Log, renamed `Fase*` headings to `Phase *`, combined phases that are proven to work into single tables, removed `fase2Plan.md` | N/A (docs only) | Done |
-| 2026-08-24 11:54 | **Root-caused Finder GUI directory-listing bug: invalid `FileAttributes` value in QUERY_DIRECTORY entries.** `smb_protocol_handle_query_directory()` set `FileAttributes = 0` for regular files (`smb_protocol.c:840`), which is not a valid Windows/SMB2 attribute value — a plain file must have at least `FILE_ATTRIBUTE_NORMAL` (`0x80`) set. The existing QUERY_INFO/CREATE code path (`smb_protocol.c:585`) already used `S_ISDIR(...) ? 0x10 : 0x80` correctly; the directory-listing encoder was inconsistent with it. Changed line 840 to match. Command-line `mount_smbfs`/`ls` tolerated the invalid value (explaining why Phase 3 validation passed), but Finder's own GUI listing silently discarded every entry with attributes=0 | `idf.py build` succeeds in `examples/basic` (53% partition free); hardware re-test in Finder GUI still pending | Fix applied, hardware validation pending |
-| 2026-08-24 (session) | **FileAttributes fix retested on hardware — GUI mount now succeeds, but multi-entry `ls` fails with `fts_read: RPC struct is bad`.** With 3 root entries (`hello.txt`, `notes`, `welcome.txt`), the kernel `mount` succeeded (`//guest:@192.168.12.2/ESP32 on /Volumes/ESP32`), but `ls -la` returned `total 0` then `fts_read: RPC struct is bad` (EBADRPC) — the same generic macOS SMB "malformed response" error previously seen during `NetrShareEnum`, now surfacing on QUERY_DIRECTORY with >1 entry. Wire-level math for the 376-byte, 3-entry `FILE_ID_BOTH_DIR_INFORMATION` buffer and `NextEntryOffset` backpatch chain checked out correctly by hand (128+120+128=376). Found and fixed one genuine wire defect: the 8-byte alignment gap after each entry's filename (e.g. 4 padding bytes after `hello.txt`, 4 after `notes`) was never zeroed — `response_buffer` is a heap buffer reused across requests without clearing, so those "unspecified" padding bytes carried leftover garbage from a prior response onto the wire. Added a `memset` of the gap in `smb_protocol_handle_query_directory()` right after each entry's filename is written | `idf.py build` succeeds in `examples/basic` (53% partition free, binary 0xe1f90 bytes); hardware re-test of `mount` + `ls -la` with all 3 entries still pending | Fix applied, hardware validation pending — this is the first case multi-entry QUERY_DIRECTORY responses have been exercised via the kernel mount path (earlier Phase 3 multi-entry listings likely only had 1 entry present at test time) |
-| 2026-08-24 12:10 | **Root-caused via packet capture: `smb_protocol_build_header_response()`'s internal `memset(body, 0, body_length)` wiped out response bodies that were written into the buffer *before* the helper was called with the real body length.** Hit in three handlers — `smb_protocol_handle_query_directory` (directory entries), `smb_protocol_handle_read` (file data), and `smb_protocol_handle_query_info` (both the `FileFsSizeInformation` and generic-file-info branches) — explaining the persistent `fts_read: RPC struct is bad` / empty Finder listings, and would also have zeroed all file-read content. Fixed all three call sites by passing `body_length=0` and setting `*response_length` manually after writing the body | `idf.py build` succeeds; hand-decoded `~/tmp/smb_capture.txt` (tcpdump `-X -nn`) confirmed the zeroed bytes before the fix | ✅ **RESOLVED** — hardware retest: Finder shows real file listings for the first time |
-| 2026-08-24 12:40 | **Fixed TCP partial-frame data loss in the client receive loop.** After the memset fix, browsing triggered a reconnect loop with `"Incomplete trailing NetBIOS frame ... discarding"` — the receive loop discarded any SMB2 request that arrived split across multiple `recv()` calls instead of buffering the partial frame. Added persistent `buffered_len` tracking across loop iterations with `memmove()`-based preservation of the leftover partial frame, plus a full-buffer-with-no-complete-frame disconnect guard | `idf.py build` succeeds | ✅ **RESOLVED** — no more reconnect loop on multi-segment requests |
-| 2026-08-24 13:05 | **Fixed ignored QUERY_DIRECTORY search pattern.** `SL_RESTART_SCAN\|SL_RETURN_SINGLE_ENTRY` (flags=0x03) probes carry a client search filename (MS-SMB2 2.2.33 `FileName`/`FileNameLength`), which was parsed into the wire struct but never applied — every single-entry probe returned whatever `readdir()` yielded first, so Finder polling for a specific not-yet-seen file spun forever. Added `smb_protocol_wildcard_match()` (case-insensitive DOS `*`/`?` matching) and filtered `readdir()` entries against the parsed search pattern | `idf.py build` succeeds; hardware log confirms probes for `hello.txt`/`welcome.txt` now match correctly instead of always returning the first directory entry | ✅ **RESOLVED** |
-| 2026-08-24 13:35 | **Fixed delete failing with `esp_littlefs: Has open FD`.** `smb_protocol_handle_close()` called `unlink()`/`rmdir()` on a delete-pending handle *before* releasing the session handle — but `smb_session_release()` is what closes the underlying fd, so the delete ran while the file was still open and `esp_littlefs` correctly refused. Reordered to release (closing the fd) first, then delete | `idf.py build` succeeds | ✅ **RESOLVED** — delete no longer logs the LittleFS "Has open FD" error |
-| 2026-08-24 13:50 | **Fixed `rm` still reporting `RPC struct is bad` after a successful delete.** Once delete-then-release order was fixed, the CLOSE response for a just-deleted file zeroed its attribute fields (`have_stat = false` after a successful unlink) — the very case the handler's own comment warns about ("macOS's kernel client rejects a CLOSE response with all-zero attributes"). Kept sending the pre-delete `stat()` already captured earlier in the function instead of discarding it | `idf.py build` succeeds | Fix applied; retest still showed the error, root cause found in next row |
-| 2026-08-24 14:05 | **Found the actual `RPC struct is bad` root cause via a second packet capture: `smb_protocol_handle_set_info()` never wrote the required `StructureSize=2` field into its SET_INFO response body**, leaving it zeroed by the header helper's memset — a spec violation (MS-SMB2 2.2.39) that macOS surfaces as a malformed-response error. Since `rm` is the only client operation that goes through SET_INFO (`FileDispositionInformation`), this explains why deletes specifically failed while every other operation (browsing, reading, CREATE/CLOSE) worked. Added the missing `smb2_put_u16_le(body, 2)` write | `idf.py build` succeeds; hand-decoded `~/tmp/smb_capture2.txt` showed bytes `00 00` where `02 00` was required; hardware retest: `rm` on root-level and nested files now completes cleanly with no client-side error | ✅ **RESOLVED** — delete (`rm`) fully working end-to-end |
-
-**Next diagnostic steps (continuing next session):** all files/dates in `ls -la` currently show identical epoch timestamps (`Jan 1 1970`) instead of real mtimes — parked, not yet investigated; likely in how `smb_vfs_stat()`/ESP-IDF's LittleFS VFS layer reports `st_mtime`, since `smb_vfs_stat()` itself is a bare passthrough to POSIX `stat()`.
-
-### Phase 5 — Cross-Platform Validation & Remaining Protocol Robustness (pending)
-
-Backlog carried over from `fase2Plan.md`'s "remaining protocol robustness" and "not yet done" sections, plus the original cross-platform milestone. Suggested logical order:
-
-1. Resolve the open Finder GUI directory-listing issue (Phase 4) and the "copy does nothing / no WRITE command" symptom.
-2. Add a proper FLUSH handler (header-only success response).
-3. Handle currently-unsupported SMB2 commands with a well-formed protocol response instead of silent drops, where the spec expects one.
-4. Review compound-request/credit handling and partial-TCP-read robustness under load (multiple concurrent clients, larger compound chains).
-5. Trim the temporary diagnostic packet dumps that were added while debugging NDR/compounding issues, now that those are resolved.
-6. Add full DCE/RPC REQUEST/RESPONSE pipeline test coverage beyond `NetrShareEnum` (e.g. additional opnums if/when needed).
-7. SMB 3.1.1 Negotiate Context support (currently out of scope; dialect stays pinned to SMB 2.0.2) — revisit only if a target client requires it.
-8. Cross-platform validation: Windows `net view`/Explorer, Linux `mount -t cifs`, iOS SMB clients (FileBrowser, etc.) — per the Validation Criteria section above.
-
-| Date & Time | Work Done | Evidence | Status |
-|-----------|-----------|----------|--------|
-| 2026-08-24 15:10 | **iOS SESSION_SETUP fix: wrapped the raw NTLM challenge in a proper SPNEGO/GSS-API `NegTokenResp` ASN.1 envelope.** macOS's `smbfs` tolerated the raw, unwrapped NTLMSSP blob sent by `smb_protocol_handle_session_setup()`, but iOS's stricter SMB client rejected it outright (`"Unknown ASN1 Class identifier"`) and dropped the connection before completing auth. Added the `[1] NegTokenResp { negState, supportedMech (NTLMSSP OID), responseToken }` wrapper around the existing NTLM challenge bytes | `idf.py build` succeeds; hardware retest: iOS `SESSION_SETUP` now completes (`status=0x00000000`) and proceeds through `IPC$`/DCE-RPC/`NetrShareEnum` cleanly | ✅ **RESOLVED** — iOS auth handshake works |
-| 2026-08-24 15:40 | **Added the mandatory 8-byte MS-SMB2 Error Response body to all non-success responses.** `smb_protocol_build_header_response()` was sending header-only (64-byte) responses for every error status, omitting the required `StructureSize=9/ErrorContextCount/Reserved/ByteCount` tail (MS-SMB2 2.2.2). macOS tolerated this; suspected as the source of iOS's on-screen `"Data loop, have N bytes, need 72"` client error. Fixed centrally in the shared helper so every error path benefits | `idf.py build` succeeds | Fix applied; did **not** resolve the iOS `TREE_CONNECT`→disconnect symptom on retest (that TREE_CONNECT actually returned `STATUS_SUCCESS`, no error body involved) — real root cause found in the row below. Kept as a genuine spec-compliance fix regardless |
-| 2026-08-24 16:10 | **Root-caused the iOS (and Mac) "crash"/disconnect right after `TREE_CONNECT` to the real `ESP32` disk share: the legacy SMB1→SMB2 negotiate handshake was pinning every connection to the oldest SMB2 dialect (0x0202).** Nearly all modern clients start with an SMB1-framed multi-protocol negotiate offering the generic `"SMB 2.???"` wildcard; `smb_protocol_handle_legacy_negotiate()` treated *any* `"SMB 2.*"` offer as a hard commitment to dialect 0x0202 instead of replying with the standard wildcard `0x02FF` (which should prompt the client to send a real `NEGOTIATE` with its full dialect list). Apple's SMB client (shared between iOS/macOS) accepts 0x0202 for anonymous share browsing (`IPC$`) but refuses real file-data access over it, silently abandoning the connection right after a successful `TREE_CONNECT` — matching every capture exactly (`IPC$` always fully works; the `ESP32` disk-share `TREE_CONNECT` succeeds, then the client vanishes before `CREATE`). Added `SMB2_DIALECT_2FF` and changed the legacy path to reply with it, letting the client's follow-up real `NEGOTIATE` select a modern dialect (up to 0x0302) via the already-working selection logic | `idf.py build` succeeds (0xe2200 bytes, 53% free) | Fix applied; hardware retest **falsified this hypothesis** — added diagnostic dialect logging confirmed the client now genuinely selects `0x0210` (not `0x0202`), yet the identical `TREE_CONNECT`→silent-disconnect symptom persisted. Kept as a genuine spec-compliance fix regardless; real root cause found in the row below |
-| 2026-08-24 16:45 | **Root-caused (log-evidenced, but ultimately falsified): `smb_protocol_handle_tree_connect()` hardcoded `tree_id = 1` for every successful `TREE_CONNECT`, and a single global `bool ipc_tree` flag on the connection tracked "is the current tree IPC$?" instead of per-tree state.** Hardware log showed the iPhone opening **two** `IPC$` `TREE_CONNECT`s (msg_id 4 and 5), both receiving `tree_id=1`, with only **one** `TREE_DISCONNECT` (msg_id 10) sent back before the `ESP32` disk-share `TREE_CONNECT` (msg_id 11) reused that same colliding `tree_id=1` — a genuine MS-SMB2 2.2.9 violation, plausible cause of the client aborting right after that response. Replaced the single global flag with a `smb_protocol_tree_t trees[SMB_SERVER_MAX_TREES]` per-connection table (`tree_id`, `in_use`, `is_ipc`) plus a monotonic `next_tree_id` counter; `TREE_CONNECT` now allocates a free slot with a unique id, `TREE_DISCONNECT` frees the matching slot, `CREATE`'s `srvsvc`-pipe check looks up the table instead of the stale global flag | `idf.py build` succeeds (0xe22f0 bytes, 53% free) | Fix applied; hardware retest **falsified this hypothesis too** — tree ids came back correctly unique (1, 2, 3) but the identical disconnect persisted. Kept as a genuine spec-compliance fix; real root cause found in the row below |
-| 2026-08-24 17:15 | **Root-caused via a cheap own-side hex dump (no packet capture needed): `smb_protocol_handle_tree_connect()` builds its own `smb2_header_t` from scratch and never sets `session_id`, so every `TREE_CONNECT` response — including the two working `IPC$` ones — was sent with `session_id=0` instead of echoing the real session id.** Every other response path (`smb_protocol_build_header_response()`) correctly echoes `ctx->last_request_header.session_id`; only this one hand-built header skipped it. Apple's SMB client evidently tolerates `session_id=0` on anonymous `IPC$` tree responses but rejects it once it's about to trust a tree for real file I/O, silently closing the connection right after `TREE_CONNECT` — matching every capture exactly. Confirmed via `ESP_LOG_BUFFER_HEXDUMP` of the outgoing response bytes on our own side (added, then compared the working vs. failing 80-byte responses field-by-field): bytes 40–47 (SessionId) were `00 00 00 00 00 00 00 00` in both. Fixed by adding `resp_header.session_id = ctx->last_request_header.session_id;` | `idf.py build` succeeds (0xe25d0 bytes, 53% free) | Fix applied; hardware retest **falsified this hypothesis too** — hex dump confirms `session_id=1` is now correctly set in every `TREE_CONNECT` response, but the identical "Data loop, have 72 bytes, need 72" disconnect on the iOS client persists unchanged. Kept as a genuine spec-compliance fix; real root cause still open (see below) |
-| 2026-08-24 (session) | **Client identified: the failing iOS app is "File Browser" (third-party App Store app), not Apple's native Files/SMBClient framework.** Re-scoping the investigation — prior rows' assumption of "Apple's SMB client" behavior does not apply here; this app has its own SMB2 client implementation of unknown provenance, so Apple SMBClient/smbfs kernel source is not a valid reference for its parsing logic. All 5 prior hypotheses (dialect pinning, missing error body, tree_id collision, session_id=0) are hardware-falsified. The outgoing `TREE_CONNECT` response is now confirmed byte-correct against the MS-SMB2 spec and format-identical to the working `IPC$` responses (only `tree_id`/`message_id`/`share_type` legitimately differ). No further server-side hypothesis is evidenced by current logs | N/A (investigation checkpoint, no code change) | **Paused by user decision** — no more code-only leads; user chose to pause this specific bug (iOS "File Browser" app disconnecting after real disk-share `TREE_CONNECT`) rather than keep spending tokens on unverified guesses. Resume with either a different iOS SMB client, a macOS Finder GUI retest, or a targeted capture, if/when the user wants to pick it back up |
-| 2026-08-24 (session) | **Found and fixed a new regression via the "Filer" app and `mount_smbfs` both failing after `SESSION_SETUP`: `smb_protocol_handle_session_setup()` computed `security_token_offset = SMB2_HEADER_SIZE + 9`, but the fixed SESSION_SETUP response body (StructureSize+Flags+SecurityBufferOffset+SecurityBufferLength) is only 8 bytes — the `9` is the *declared* `StructureSize` field value (spec convention: fixed-size+1), mistakenly reused as a byte offset.** Confirmed via `ESP_LOG_BUFFER_HEXDUMP` of the outgoing response: body byte 8 (absolute offset 72) was never written (leftover stack garbage, `0x53` in the capture), and the real SPNEGO/NTLM challenge blob (`a1 77 30 75...`) was shifted one byte late to offset 73. A client that trusts the `SecurityBufferOffset` field (iOS Files app) still finds it fine; a client that assumes the buffer starts immediately after the fixed body (`mount_smbfs`, "Filer") reads the garbage byte first, fails ASN.1 parsing, and aborts with `LOGOFF` — matching every symptom from both clients. Also separately fixed: `ctx->session_setup_started` was never reset on `LOGOFF`, so a retry `SESSION_SETUP` on the same TCP connection was wrongly treated as leg-2 and got a premature `STATUS_SUCCESS`; added `ctx->session_setup_started = false` in the `LOGOFF` case | `idf.py build` succeeds (0xe25e0 bytes, 53% free) | Both fixes confirmed byte-correct via a second hex dump (no gap byte, SPNEGO token starts exactly at the declared offset) — but `mount_smbfs`/"Filer" still sent `LOGOFF` immediately after this now-correct leg-1 response, never attempting leg-2. Real root cause found in the row below |
-| 2026-08-25 (session) | **Root-caused: the server always replied to `SESSION_SETUP` with a SPNEGO/GSS-API-wrapped NTLM challenge, but `mount_smbfs` and "Filer" send a bare, unwrapped `NTLMSSP\0` negotiate token (confirmed via a hex dump of the client's own incoming security buffer) — mismatched envelope format, not a byte-offset error.** iOS "Files" needs the SPNEGO wrapper (rejects raw NTLMSSP); `mount_smbfs`/"Filer" need the raw form (as in the original Phase 3 implementation, before the SPNEGO wrap was added for iOS). Fixed by detecting which form the client sent (`memcmp` of the first 8 bytes against `"NTLMSSP\0"`) and mirroring it back: SPNEGO-wrapped `NegTokenResp` for SPNEGO-wrapped requests, the same 94-byte NTLM Challenge unwrapped for bare-NTLMSSP requests | `idf.py build` succeeds (0xe26a0 bytes, 53% free) | ✅ **RESOLVED** — hardware retest: `mount_smbfs` mounts, browses, and reads files; "Filer" completes auth, connects, and lists all folders/files |
-| 2026-08-25 11:45 | **Implemented real, spec-correct `SMB2_CHANGE_NOTIFY` (0x0f) async support — a deliberate scope expansion beyond the original "Explicitly Out of Scope" list (removed from that list above), requested by the user after a hardware log showed the "Filer" app's continuous CREATE+QUERY_DIRECTORY+CLOSE polling caused by the command returning `STATUS_NOT_SUPPORTED`.** Added a small fixed-size global pending-watch table (`SMB_SERVER_MAX_NOTIFY_WATCHES=8`) protected by its own mutex. `CHANGE_NOTIFY` registers a watch on the given directory handle and replies immediately with the MS-SMB2 interim `STATUS_PENDING` async response (`AsyncId` packed into the same wire bytes the sync header uses for `Reserved`/`TreeId`, confirmed via `smb_packet.c`'s codec). `CREATE` (on genuine new-object creation) and `CLOSE` (on a successful delete) call `smb_protocol_notify_fire()`, which marks matching watches fired. Since the ESP-IDF VFS has no filesystem-change-event API and each client connection has only one blocking `recv()`, added a 1-second `SO_RCVTIMEO` to the client socket; a receive timeout now polls the table (`smb_protocol_notify_poll()`) for this connection's fired watches and sends the real final async response (`FILE_NOTIFY_INFORMATION`, MS-FSCC 2.7.1) instead of treating the timeout as a disconnect. Also implemented real `SMB2_CANCEL` (0x0c) handling (previously `STATUS_NOT_SUPPORTED`) so a client-cancelled watch frees its slot immediately rather than waiting for disconnect, and watch cleanup on `TREE_DISCONNECT`/`LOGOFF`/connection-end. **Three accepted spec deviations** (documented in the implementation plan): (1) firing all matching watches on an event rather than strict FIFO-per-handle ordering; (2) `TREE_DISCONNECT` cleanup is connection-wide, not tree-scoped (slots don't track `tree_id`); (3) no `CompletionFilter` bit-matching — fires on any watched-path match regardless of which change types were requested | `idf.py build` succeeds (0xe3140 bytes, 53% free) | Implemented and build-verified; hardware retest with "Filer" (confirm interim `STATUS_PENDING`, real create/delete notifications, and that the CREATE/QUERY_DIRECTORY busy-poll pattern disappears) still pending |
-| 2026-08-25 12:33 | **Fixed two CHANGE_NOTIFY bugs found via hardware capture with "Filer" (create+delete round trips): (1) `create_action` was unconditionally forced to `3` (FILE_OVERWRITTEN) for `FILE_OVERWRITE`/`FILE_OVERWRITE_IF`/`FILE_SUPERSEDE` dispositions in the CREATE handler, clobbering the correct `create_action=2` for genuinely new files and silently skipping the ADDED fire-hook; gated the override on `if (exists)`. (2) `smb_protocol_notify_fire()`/`_poll()` used `result_status != 0` as the "has this watch fired?" test, but `STATUS_SUCCESS` is `0x00000000` — the same value as the "still pending" sentinel — so a fired watch was indistinguishable from a never-fired one and `notify_poll()` never delivered the final async response. Added an explicit `bool fired` field to `smb_protocol_notify_watch_t` and updated `notify_register`/`notify_fire`/`notify_cancel`/`notify_poll` to use it instead of the overloaded zero-check.** Root-caused bug (2) required temporary `ESP_LOGI` DEBUG lines at register/fire/poll (added, then fully removed and grep-verified) — evidence showed `matches=1` fires that never changed `result_status` on later poll ticks, and the same watch slot matching two unrelated fire events. See the new "CHANGE_NOTIFY invariants" note under Notes for Developers for the do-not-repeat contract | `idf.py build` succeeds (fixes applied, user builds/flashes manually); hardware retest with a post-fix capture (confirming `"Sent CHANGE_NOTIFY final response"` actually appears) still pending | Fix applied, hardware validation of this specific fix pending |
-| 2026-08-25 13:24 | **Phase 5 backlog: fixed a cross-client concurrency bug and added two compound-request hardening guards.** (1) **Concurrency bug**: `s_handles[]` in `smb_session.c` (open file/directory/pipe handles) is a global table, and `SMB2_TREE_DISCONNECT`/`SMB2_LOGOFF` both called the global `smb_session_reset()` — so any one connected client's tree-disconnect or logoff silently closed every *other* client's open handles too, since the server spawns one task per connection but shared this state. Added `owner_socket` to `smb_session_handle_t`, threaded `ctx->socket`/`client_socket` through `smb_session_allocate_file/_directory/_pipe`, and added `smb_session_release_by_socket(int owner_socket)` (mirroring the existing `smb_protocol_notify_release_by_socket()` pattern) to replace the two problematic `smb_session_reset()` call sites (TREE_DISCONNECT/LOGOFF and end-of-connection cleanup). `smb_session_reset()` itself is untouched and still used once at server startup (`smb_server.c`), before any client connects, where a full wipe is correct. (2) **Compound-chain cap**: added `SMB_SERVER_MAX_COMPOUND_COMMANDS=16` and an iteration counter in `smb_protocol_process_request()`'s compound loop, truncating gracefully (same path used for a failed sub-parse) if a malformed/hostile `next_command` chain exceeds it. (3) **`smb2_parse_header()` bounds fix**: the function checked `length < 14` but then unconditionally read fields up to byte 63; gated each field read past byte 14 on `length >= N`, relying on the existing `memset()` zero-fill for unread fields — fixes an out-of-bounds-within-buffer read for short compound sub-frames. (4) Removed three leftover always-on `ESP_LOG_BUFFER_HEXDUMP(..., ESP_LOG_INFO)` diagnostic dumps (Session Setup request/response, Tree Connect response) left over from now-resolved bugs; `smb_protocol_dump_packet()` (already `ESP_LOGD`-gated) remains available on demand. Also confirmed during this pass that the FLUSH handler and graceful `STATUS_NOT_SUPPORTED` responses for unsupported commands were already implemented — no change needed for those two backlog items | `idf.py build` succeeds (user builds/flashes manually) | Fix applied; hardware validation (ideally two clients connected simultaneously, e.g. `mount_smbfs` + "Filer") still pending |
-| [to be filled in] | Further cross-platform validation (Windows/Linux) | [Windows/Linux testing] | Pending |
-
----
 
 ## Milestones and Go/No-Go Checkpoints
 
-**End of Phase 1:** ✅ SMB2 packets parse correctly; sessions/trees/files can be allocated and released.
+**End of Phase 1:** SMB2 packets parse and serialize correctly; sessions/trees/
+files can be allocated and released; ECHO keepalives answered.
 
-**End of Phase 2:** ✅ `smbutil view -G '//guest@<ESP_IP>'` completes and enumerates shares without `RPC struct is bad`; directory listing and NetrShareEnum work over the wire.
+**End of Phase 2:** file create/read/write/delete validated on hardware via a
+kernel-path mount.
 
-**End of Phase 3:** ✅ `mount_smbfs`/Finder kernel-path mounting works end-to-end; file/directory read, write, create, and delete validated on hardware from the command line.
+**End of Phase 3:** multi-entry `ls` (no `fts_read: RPC struct is bad`) and
+Finder GUI listings show correct names, sizes and types.
 
-**End of Phase 4:** ⏳ Files are visible and usable through the Finder **GUI** (not just command-line tools) — currently blocked, see Phase 4 above.
+**End of Phase 4:** `smbutil view -G` lists the share without "Broken pipe";
+`mount_smbfs` mounts without the 122 s hang.
 
-**End of Phase 5:** All validation criteria pass on Windows, Linux, and iOS, and the remaining protocol-robustness backlog is cleared.
-
----
+**End of Phase 5:** CHANGE_NOTIFY interim + final responses observed on the
+wire; concurrent clients don't interfere; all Validation Criteria pass (iOS
+third-party app outstanding — see Known Open Items).
 
 ## Notes for Developers
 
-- Keep protocol implementation independent from VFS layer (swap VFS for LittleFS, FatFS or other FS later)
+- Keep the protocol layer independent from the VFS layer (all FS access goes
+  through `smb_vfs.c`; swapping LittleFS ↔ FatFS must not touch handlers)
 - Use ESP_LOGI/ESP_LOGW/ESP_LOGE for all logging (no printf)
 - Prefix comments with `//--` (project convention)
 - Use Allman brace style and 2-space indentation
-- Test frequently on hardware; do not assume compilation implies correctness
-- Do NOT skip security validation (path traversal checks, buffer overflows, etc.)
+- Test frequently on hardware; compilation never implies protocol correctness —
+  NDR/offset bugs only surface on the wire (tcpdump `-X -nn` + hand-decoding, or
+  an `ESP_LOG_BUFFER_HEXDUMP` of the *outgoing* response, settles debates the
+  spec can't)
+- Do NOT skip security validation (path traversal checks, buffer bounds,
+  offset/length validation of every variable data area before reading)
+- Never hand-build a response header without echoing `session_id`
 
-### CHANGE_NOTIFY invariants (do not reintroduce these two bugs)
+## Known Open Items (as of current code)
 
-The `SMB2_CHANGE_NOTIFY` pipeline (`smb_protocol_notify_register/_fire/_cancel/_poll` in
-`smb_protocol.c`) has two invariants that were each broken once and are easy to break again
-while working on unrelated CREATE/CLOSE code:
-
-1. **A notify watch's "has this fired?" state MUST be tracked with the dedicated `bool fired`
-   field on `smb_protocol_notify_watch_t` — never by checking `result_status` against `0`.**
-   `STATUS_SUCCESS` is `0x00000000`, so a zero-check collides with "still pending" and silently
-   swallows every final CHANGE_NOTIFY response. If you touch `notify_register`/`notify_fire`/
-   `notify_cancel`/`notify_poll`, all four must keep reading/writing `fired`, and `result_status`
-   must only be read once `fired == true`.
-2. **`create_action` in the CREATE handler must stay `2` (FILE_CREATED) for a genuinely new file,
-   even when the request's disposition is `FILE_OVERWRITE`/`FILE_OVERWRITE_IF`/`FILE_SUPERSEDE`.**
-   Only force `create_action = 3` (FILE_OVERWRITTEN) when the file already `exists`. The
-   fire-on-create hook (`if (create_action == 2) smb_protocol_notify_fire(..., FILE_ACTION_ADDED, ...)`)
-   depends on this value being accurate — an unconditional override here silently breaks ADDED
-   notifications for any client that opens new files with an overwrite-style disposition (e.g.
-   the "Filer" iOS app).
+- `mount_smbfs` `ls -la` shows epoch timestamps (`Jan 1 1970`) — `st_mtime`
+  reporting via the LittleFS VFS layer suspected; `smb_vfs_stat()` is a bare
+  `stat()` passthrough — parked
+- Under sustained copy load a mid-WRITE framing desync can occur: a frame
+  announces fewer bytes than it carries and the next "NetBIOS header" is
+  actually file data (`ff ff ff ff`-style announcements). Diagnostics (type-byte
+  WARN, stalled-frame WARN + 16-byte dumps) are in place; root cause (client
+  abort vs. announced/actual mismatch) not yet identified
+- CHANGE_NOTIFY end-to-end behaviour (interim PENDING, real create/delete
+  notifications, disappearance of the CREATE/QUERY_DIRECTORY busy-poll pattern)
+  implemented and build-verified, hardware retest pending
+- Windows `net view`/Explorer and Linux `mount -t cifs` validation pending

@@ -17,6 +17,25 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Changelog
 
+fileVersion: [2] - 20-11-2026 - 11:18
+
+## Unreleased
+
+- `smb_server`: fixed a forced disconnect during file uploads — the
+  receive loop now grows the per-connection request buffer to the
+  announced NetBIOS frame size (clients send up to the advertised
+  64 KB `max_write_size` WRITE requests in one frame) instead of
+  disconnecting with `NetBIOS frame exceeds buffer size`.
+- `smb_server`: always-grant `SMB2_LOCK` (0x0a) with a header-only
+  success response instead of `STATUS_NOT_SUPPORTED`.
+- `smb_server`: added framing-desync diagnostics (hex dump of the
+  offending frame on oversized/ill-typed NetBIOS frames and on stalled
+  partial frames); a mid-WRITE-stream desync is currently open and
+  awaiting a retest log.
+- Example app: the verbosity tweak is a `__attribute__((constructor))`
+  that silences `smb_protocol`/`smb_packet` before `app_main()` (bare
+  `esp_log_level_set` calls at file scope do not compile).
+
 ## 0.3.0
 
 - Restored a buildable application at the repository root (root
